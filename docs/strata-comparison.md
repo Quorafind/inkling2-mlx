@@ -81,7 +81,7 @@ Strata 已经修复，输出正确。
 
 ### 本项目：实测
 
-测试机为 Mac mini M6，12 核 GPU，32 GB 内存，实测带宽约 140 GB/s。配置为 6-bit dense、8-bit KV、8-bit 草稿层。
+测试机为 Mac mini M6，12 核 GPU，32 GB 内存，带宽规格 170 GB/s，内核实测约 140 GB/s。配置为 6-bit dense、8-bit KV、8-bit 草稿层。
 
 | 项目 | 结果 |
 | --- | --- |

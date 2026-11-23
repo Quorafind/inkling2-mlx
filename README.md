@@ -356,13 +356,19 @@ attention. The remaining glue is roughly:
   - lm_head: 0.49 GB at 8 bits, 0.38 GB at 6 bits;
   - KV: about 0.25 GB at 4k context (168 MB of sliding rings plus the 8-bit full-attention
     cache).
-- **This M6's ceiling.** An 8-bit quantized GEMV over 0.32 GB and a plain reduction both
-  measure about 140 GB/s. With 8-bit dense layers, that puts the single-request floor at
-  about 30 ms per token (33 tok/s), and plain decoding runs at 33.8 ms, about 90 % of it.
-  With the 6-bit default the floor is about 27 ms, and plain decoding runs at about 29.5 ms
-  (34 tok/s).
-  - Most of the remaining 3 to 4 ms is the serial chain of about 20 dependent kernels per
-    visit, 48 visits per token. Each dependent dispatch costs about 3.5 µs on this GPU.
+- **This M6's ceiling.** The 32 GB M6 Mac mini is specified at 170 GB/s (153 GB/s for the
+  16 GB model). Kernels get less: a vectorized Metal read kernel and `mx.sum` over 2 GB
+  measure 134 to 148 GB/s depending on the run, and an 8-bit quantized GEMV over 0.32 GB
+  about 140 GB/s. mlx-swift-lm PR #821 reports a measured 155 GB/s on the same machine. At
+  140 GB/s the 6-bit default's floor is about 25 to 27 ms per token, and plain decoding runs
+  at 29.5 to 31 ms (32 to 34 tok/s), about 85 to 90 % of it.
+  - `tests/decode_breakdown.py` splits the step by removing parts of it. Skipping the routed
+    experts saves about 17 ms, against a byte floor of about 13 ms for their 1.84 GB, so the
+    expert path (router, top-k, two `gather_qmm`, SwiGLU, weighted sum) reads at about
+    105 GB/s. The dense layers, attention and glue take about 12.5 ms at both 6 bits
+    (1.34 GB) and 4 bits (1.02 GB): that part is bound by latency, not bytes.
+  - The latency is the serial chain of about 20 dependent kernels per visit, 48 visits per
+    token. Each dependent dispatch costs about 3.5 µs on this GPU.
   - Thinking Machines' chart is a theoretical ceiling at 614 GB/s (M5 Max class).
 - **Batching reads each weight once per step for all rows.** The cost grows with the number of
   *distinct* experts the rows touch: about 39 of 128 per visit for 16 rows. MLX's
@@ -586,7 +592,7 @@ attention. The remaining glue is roughly:
 
 | Regime | Utilization | Bottleneck |
 | --- | --- | --- |
-| Decode, one request | About 90 % of bandwidth (6-bit dense: 3.8 GB per token in about 29.5 ms at 4k context, vs about 27 ms at 140 GB/s), about 2 % of compute | Reading weights, plus about 3 to 4 ms per token of serial small-kernel latency |
+| Decode, one request | About 85 to 90 % of measured bandwidth (6-bit dense: 3.8 GB per token in 29.5 to 31 ms at 4k context, vs about 27 ms at 140 GB/s; the spec is 170 GB/s), about 2 % of compute | Reading weights, plus about 3 to 4 ms in the expert path above its byte floor and about 3 ms of serial small-kernel latency in the dense part |
 | Prefill | About 5.6 TFLOPS effective. The NVFP4 expert and 8-bit dense GEMMs themselves run at 12–15 TFLOPS, so about half the time is spent outside them | Non-GEMM work: route sort / gather / scatter, sliding-layer masks, short convolutions, small ops |
 | Batch of 16 | 76 tok/s in total | The union of distinct experts per visit |
 
@@ -646,6 +652,20 @@ What the loop permits, measured:
   equivalent per-query shift (`mask - sink`, zero head sinks) is exact in real arithmetic but
   adds a BF16 rounding of the shifted mask, about 2.5 ulp. The sink-slot caches do the same
   job exactly.
+- **4-bit dense layers.** `--dense-bits 4` reads 3.12 GB per token instead of 3.56 (KV
+  excluded), but in the same run plain decoding only goes from 31.2 to 29.4 ms per token
+  (32.1 → 34.0 tok/s, `tests/decode_breakdown.py`), because the dense part is latency-bound.
+  It also costs precision: mean KL against CPU-FP32 truth 0.029 instead of 8.2e-3, top-1
+  89.5 % instead of 95.0 %. mlx-swift-lm PR #821 decodes the same model with 4-bit dense
+  layers and the same native NVFP4 / MXFP8 experts at 43.7 tok/s short, 40.2 at 3.3K and
+  36.7 at 13K; this runtime gets about 34, 33.3 and 31.7.
+  - The PR runs the decode experts as two fused kernels (gate/up with the softcapped SwiGLU;
+    down with the weighted sum, short convolution and residual) that read NVFP4 / MXFP8
+    directly at 135 to 150 GB/s, and each sublayer as a few fused kernels. Here the expert
+    path reads at about 105 GB/s and the dense part is a chain of about 20 kernels per visit.
+    Fusing those, not fewer bits, is what closes the gap.
+  - The gap narrows with context: from short to 13K the PR's step grows by 4.4 ms, this one by
+    about 2 ms (8-bit KV and the split-K decode attention).
 - **Removing graph nodes buys little by itself.** About 3,600 fewer nodes saved about 2 ms,
   because most of them were views or tiny kernels.
 - **Don't misread ablations:**
@@ -744,7 +764,7 @@ What the loop permits, measured:
 | `tests/check_launcher.py`, `tests/check_launcher_sdk.py` | The Rust launcher end to end over HTTP, and with the official `openai` SDK: both APIs streaming and not, tool calls, `previous_response_id`, GET / DELETE, disconnect cancels, errors, turn-2 latency | all pass; turn 2 of an 8k conversation 9.25 s cold → 0.29–0.32 s |
 | `tests/check_screened_draft.py` | Screened vs full-vocabulary Markov drafting on the same draft features every round (prose and code, T = 0 / 1): draft agreement up to BF16 ties in the reference, shortlist coverage, confidence difference, Markov-loop time | 256 × top-16: 98.8 % agreement, 1.6 vs 2.6 ms |
 | `tests/trace_spec.py` + `tests/sim_spec_policy.py` | Fixed-block-8 DSpark traces (per-position draft probability, accepted count, draft / verify time, the V(L) curve), and a replay of verify-length policies on them, including an oracle | see Performance, item 10 |
-| `tests/bench_*.py`, `tests/profile_decode.py` | Speed tables and the decode breakdown | numbers above |
+| `tests/bench_*.py`, `tests/profile_decode.py`, `tests/decode_breakdown.py` | Speed tables, the decode breakdown, and each part of a step against its byte floor | numbers above |
 
 ## Architecture notes
 

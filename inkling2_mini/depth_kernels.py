@@ -157,11 +157,12 @@ def _source(NB, Q, H, write_mixed, norm, w_rows, conv, base):
 
 def depth_mix(blocks, query, last=None, norm_weight=None, write_mixed=False, out_dtype=mx.bfloat16,
               conv=None):
-    """One to MAX_TOKENS tokens (B = 1). blocks: earlier states (each (1, T, H)); query (H,) or (Q, H).
+    """One to MAX_TOKENS tokens (rows of a batch or positions of a verify block; the mix is
+    per token). blocks: earlier states (each (B, L, H)); query (H,) or (Q, H).
     The partial state is `last` ((.., H)), or, with conv = (attn, state, conv_weight, base),
     base + T(conv(attn)) computed here (base None: no residual add).
-    Returns dict with 'mixed' (1, 1, Q, H) FP32, 'normed' (1, 1, Q, H) out_dtype, 'residual'
-    (1, 1, H) FP32 and 'state' (1, 3, H) FP32 (conv only)."""
+    Returns dict with 'mixed' (B, L, Q, H) FP32, 'normed' (B, L, Q, H) out_dtype, 'residual'
+    (1, 1, H) FP32 and 'state' (1, 3, H) FP32 (conv only, one token)."""
     cache = ACTIVE
     query = query.reshape(-1, query.shape[-1]).astype(mx.float32)
     Q, H = query.shape
@@ -212,8 +213,9 @@ def depth_mix(blocks, query, last=None, norm_weight=None, write_mixed=False, out
         cache.put(out["residual"], r["xnorm"])
     else:
         cache.put(last, r["xnorm"])
+    lead = (1, 1) if has_conv else tuple(last.shape[:-1])
     if write_mixed:
-        out["mixed"] = r["mixed"].reshape(1, T_, Q, H)
+        out["mixed"] = r["mixed"].reshape(*lead, Q, H)
     if norm:
-        out["normed"] = r["normed"].reshape(1, T_, Q, H)
+        out["normed"] = r["normed"].reshape(*lead, Q, H)
     return out

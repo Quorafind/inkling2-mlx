@@ -28,6 +28,8 @@ tiny, model_dir = Path(sys.argv[1]), Path(sys.argv[2])
 with mx.stream(mx.cpu):
     t = Inkling2Mini.__new__(Inkling2Mini)
     t.model, t.drafter, t.eos_id, t.kv_bits = load(tiny, verbose=False), None, -1, None
+    t.text_config = t.model.language_model.config
+    t.passes = t.text_config.num_passes
     rng = np.random.default_rng(3)
     a, b = rng.integers(0, 500, (1, 11)), rng.integers(0, 500, (1, 6))
     state = t.new_state()

@@ -2,7 +2,8 @@
 
 A Rust launcher that serves Inkling 2 Mini on a local OpenAI-compatible API. It starts
 one model worker (`inkling2_mini/server_worker.py` in the project's `.venv`) and handles
-HTTP, the OpenAI wire formats, queueing and cancellation itself.
+HTTP, the OpenAI wire formats and cancellation itself. The worker schedules the requests and
+batches concurrent ones.
 
 ```bash
 ./inkling2                          # from the project root: builds on first use, serves 127.0.0.1:8000
@@ -28,6 +29,25 @@ curl $OPENAI_BASE_URL/chat/completions -H 'Content-Type: application/json' \
 | `GET /v1/models`, `GET /health` | |
 
 Not supported: `n > 1`, logprobs, hosted tools (web search, file search), and the Anthropic Messages API.
+
+Extension: `"passes": N` in a request body (both APIs; `extra_body` in the OpenAI SDKs) sets the
+loop pass count for a variable-loop checkpoint (`TML-d24-varloop-research`, 1 to 5). A
+conversation keeps the pass count it started with: stored states only match requests with
+the same count.
+
+## Concurrent requests
+
+Requests are batched continuously. A request that is alone decodes on the single-request
+path (DSpark speculative decoding, 8-bit KV): about 35 tok/s. When others arrive, each one is
+prefilled and joins the running batch, and they all decode together: about 48 tok/s in total
+at 2 requests, 57 at 4, 72 at 8 and 89 at 16 (`tests/bench_server_batch.py`). Finished
+requests leave the batch with their state stored for KV reuse, and the last one goes back to
+decoding alone.
+
+While a new prompt is prefilled, the running requests get 25 % of the time (`--decode-share`
+on the worker), so they keep streaming slowly. An 8k-token prompt then takes 10.6 s to its
+first token instead of 8.8 s. Requests beyond `--max-batch`, or beyond `--batch-gb` of batch
+KV memory, wait for a slot.
 
 ## KV reuse
 
@@ -68,6 +88,9 @@ measured in the same session).
 | `--dense-bits` | 6 |
 | `--kv-bits` | 8 |
 | `--no-spec` | DSpark stays on |
+| `--max-batch` | 16 requests decoding at once (1 = one at a time) |
+| `--batch-gb` | 6 GB for the running batch's KV caches |
+| `--passes` | the checkpoint's (3); 1 to 5 for the variable-loop checkpoint |
 | `--max-context` | 65,536 tokens |
 | `--effort` | `low`, used when a request sets none |
 | `--max-tokens` | 8,192, used when a request sets none |
@@ -83,7 +106,9 @@ project root:
 
 - `tests/check_server_worker.py MODEL_DIR` tests the worker protocol: KV reuse, independent
   clones, the prefix snapshot, tool calls, stop sequences and cancel.
-- `tests/check_launcher.py` runs every endpoint end to end over HTTP, then the turn-2
-  latency table above.
+- `tests/check_server_batching.py MODEL_DIR` tests continuous batching in the worker: requests
+  at once, joining mid-stream, cancel and stop inside a batch, follow-up turns on batched replies.
+- `tests/check_launcher.py` runs every endpoint end to end over HTTP, four concurrent streams,
+  then the turn-2 latency table above.
 - `tests/check_launcher_sdk.py PORT` runs the official `openai` Python SDK against a running
   server.

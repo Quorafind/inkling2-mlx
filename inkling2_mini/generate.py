@@ -94,7 +94,10 @@ class Reply:
 
 
 def make_sampler(temperature=1.0, top_p=1.0, top_k=0):
-    def sample(logits):
+    """Returns sample(logits, key=None) -> token ids; `key` gives the row its own random
+    stream (per-request seeds inside a batch)."""
+
+    def sample(logits, key=None):
         logits = logits.reshape(-1, logits.shape[-1])
         if temperature <= 0:
             return mx.argmax(logits, axis=-1)
@@ -111,7 +114,7 @@ def make_sampler(temperature=1.0, top_p=1.0, top_k=0):
             sorted_logits = mx.where(keep, sorted_logits, -mx.inf)
             inverse = mx.argsort(order, axis=-1)
             logits = mx.take_along_axis(sorted_logits, inverse, axis=-1)
-        return mx.random.categorical(logits)
+        return mx.random.categorical(logits, key=key)
 
     return sample
 
@@ -121,16 +124,27 @@ def _cache_arrays(cache):
 
 
 class Inkling2Mini:
-    def __init__(self, model_dir, verbose=True, speculative=True, dense_bits=6, kv_bits=8):
+    # Pass counts a variable-loop checkpoint was trained with (TML-d24-varloop-research).
+    VARLOOP_PASSES = range(1, 6)
+
+    def __init__(self, model_dir, verbose=True, speculative=True, dense_bits=6, kv_bits=8, passes=None):
         """dense_bits: 6 (default) quantizes attention projections + lm_head to affine 6-bit
         (KL at the model's own BF16 noise, fewest bytes per token); 8 is near-lossless;
-        16 / None keeps the checkpoint's native BF16 for them."""
+        16 / None keeps the checkpoint's native BF16 for them.
+        passes: loop passes for new states (default: the checkpoint's, 3). Variable-loop
+        checkpoints take 1 to 5; Inkling 2 Mini is only trained for 3."""
         from mlx_vlm.models.inkling2.processing_inkling2 import Inkling2Processor
 
         self.model_dir = Path(model_dir)
         info = mx.device_info() if hasattr(mx, "device_info") else mx.metal.device_info()
         mx.set_wired_limit(info["max_recommended_working_set_size"])
         self.model = load(self.model_dir, verbose=verbose, dense_bits=dense_bits)
+        self.text_config = self.model.language_model.config
+        self.passes = self.check_passes(passes or self.text_config.num_passes)
+        self.text_config.loop_config["num_passes"] = self.passes  # default for cache-less calls
+        if verbose and (self.text_config.is_varloop or passes):
+            kind = "variable-loop checkpoint (1-5 passes), " if self.text_config.is_varloop else ""
+            print(f"[inkling2-mini] {kind}{self.passes} loop pass{'es' if self.passes > 1 else ''}")
         # Full-attention KV caches: 8-bit (default; fused decode kernel, half the memory) or
         # None / 16 for BF16. Batched decoding always uses BF16 caches.
         self.kv_bits = kv_bits if kv_bits and kv_bits < 16 else None
@@ -147,6 +161,25 @@ class Inkling2Mini:
             for name in (MESSAGE_MODEL, CONTENT_TEXT, CONTENT_THINKING, CONTENT_TOOL_JSON, END_MESSAGE, END_SAMPLING)
         }
         self.eos_id = self.model.config.eos_token_id
+
+    def check_passes(self, passes):
+        passes = int(passes)
+        cfg = self.text_config
+        if cfg.is_varloop and passes not in self.VARLOOP_PASSES:
+            raise ValueError(f"this variable-loop checkpoint was trained with 1 to 5 passes, not {passes}")
+        if passes < 1 or passes > 8:
+            raise ValueError(f"passes must be 1 to 8, not {passes}")
+        return passes
+
+    def state_passes(self, state):
+        return self.text_config.passes_for(len(state.cache))
+
+    def capture_ids(self, state, drafter=None):
+        """Draft feature visits for this state's pass count (None without a drafter)."""
+        drafter = self.drafter if drafter is None else drafter
+        if drafter is None:
+            return None
+        return drafter.capture_ids(self.text_config, self.state_passes(state))
 
     # ---------------------------------------------------------------- prompt
     def render(self, messages, reasoning_effort=None, tools=None) -> str:
@@ -178,6 +211,17 @@ class Inkling2Mini:
     def _prefill(self, h, cache, step, capture, ctx=0):
         """Returns last-position logits and, with capture, the draft features of all
         positions. ctx: tokens already in the cache (sizes the chunks)."""
+        it = self.prefill_chunks(h, cache, step, capture, ctx)
+        while True:
+            try:
+                next(it)
+            except StopIteration as done:
+                return done.value
+
+    def prefill_chunks(self, h, cache, step, capture, ctx=0):
+        """_prefill as a generator: yields the number of tokens processed after every
+        chunk but the last, so a scheduler can run other work in between; returns
+        (last-position logits, draft features or None)."""
         lm = self.model.language_model
         feats, start, n = [], 0, h.shape[1]
         while True:
@@ -192,13 +236,14 @@ class Inkling2Mini:
                 break
             mx.eval(out, feats, _cache_arrays(cache))
             mx.clear_cache()
+            yield start
         logits = lm.logits(out[:, -1:])
         return logits, (mx.concatenate(feats, axis=1) if capture is not None else None)
 
     def prefill(self, input_ids, state, prefill_step=1024):
         """Process text tokens into `state` without sampling (prefix snapshots). The
         state then continues with generate_tokens(more_ids, state=state)."""
-        capture = list(self.drafter.config.target_layer_ids) if self.drafter is not None else None
+        capture = self.capture_ids(state)
         h = self.model.embed(input_ids)
         if state.pending:
             h = mx.concatenate([self.model.embed(mx.array([state.pending])), h], axis=1)
@@ -211,8 +256,12 @@ class Inkling2Mini:
         mx.eval(_cache_arrays(state.cache))
         return state
 
-    def new_state(self, kv_bits=None):
-        return GenState(cache=self.model.make_cache(kv_bits=kv_bits if kv_bits is not None else self.kv_bits))
+    def new_state(self, kv_bits=None, passes=None):
+        """kv_bits: None = the bot's default (16 = BF16); passes: None = the bot's default."""
+        kv_bits = kv_bits if kv_bits is not None else self.kv_bits
+        passes = self.check_passes(passes) if passes else self.passes
+        return GenState(cache=self.model.make_cache(kv_bits=kv_bits if kv_bits and kv_bits < 16 else None,
+                                                    passes=passes))
 
     def generate_tokens(
         self,
@@ -228,8 +277,15 @@ class Inkling2Mini:
         speculative=True,
         block_size=None,
         state=None,
+        should_pause=None,
     ) -> Iterator[tuple]:
         """Yields (token_id, stats) pairs; stats is filled in on the last token.
+
+        should_pause: optional callable, polled between tokens. When it returns True the
+        generator stops early without final stats, leaving `state` consistent (every
+        emitted token but the last processed, the last in `pending`), so the
+        conversation can be continued later or in another decoding mode (the server's
+        continuous batching).
 
         state: a GenState to continue (multi-turn KV reuse). Its caches hold every
         token processed so far; `pending` tokens were emitted but not yet processed
@@ -243,7 +299,8 @@ class Inkling2Mini:
         state = state if state is not None else self.new_state()
         cache = state.cache
         drafter = self.drafter if speculative else None
-        capture = list(drafter.config.target_layer_ids) if drafter is not None else None
+        capture = self.capture_ids(state, drafter) if drafter is not None else None
+        pause = should_pause or (lambda: False)
 
         t0 = time.perf_counter()
         h = self.model.embed(input_ids, pixel_values, image_grid_thw)
@@ -288,16 +345,17 @@ class Inkling2Mini:
             while True:
                 n += 1
                 done = n >= max_tokens
-                if not done:  # y is processed now, before we know whether it is EOS
+                paused = not done and pause()
+                if not done and not paused:  # y is processed now, before we know whether it is EOS
                     next_y = sample(lm(y.reshape(1, 1), cache=cache))
                     mx.async_eval(next_y)
                     state.length += 1
                 token = y.item()
-                if done:
+                if done or paused:
                     state.pending = [token]
                 done = done or token == self.eos_id
                 yield token, (finish(n) if done else None)
-                if done:
+                if done or paused:
                     return
                 if n % 256 == 0:
                     mx.clear_cache()
@@ -323,6 +381,8 @@ class Inkling2Mini:
         yield b, None
 
         while True:
+            if pause():  # between rounds the state is consistent: b is pending
+                return
             bs = min(policy.choose(), max_tokens - n + 1)
             t_round = time.perf_counter()
             conf = ()
@@ -351,7 +411,10 @@ class Inkling2Mini:
                 nxt = sample(lm.logits(out)).reshape(1, 1)
                 feats.append(mx.concatenate(caps, axis=-1))
                 mx.async_eval(nxt, feats[-1])
-                for i in range(k):
+                i = 0
+                while i < k:
+                    if i < k - 1 and pause():
+                        k = i + 1  # end the segment at this token: it stays pending
                     if i < k - 1:  # process the token before reading it (pipelining)
                         out, caps = lm.model(nxt, cache=cache, capture=capture)
                         state.length += 1
@@ -370,6 +433,7 @@ class Inkling2Mini:
                     yield token, None
                     if i < k - 1:
                         nxt = nxt2
+                    i += 1
                 b = token
                 hidden = mx.concatenate(feats, axis=1)
                 state.pending, state.hidden = [b], hidden
@@ -468,7 +532,7 @@ class Inkling2Mini:
         t0 = time.perf_counter()
         caches, first = [], []
         for ids in batch_ids:
-            cache = self.model.make_cache()  # BF16 KV: batch merging needs plain caches
+            cache = self.model.make_cache(passes=self.passes)  # BF16 KV: batch merging needs plain caches
             logits, _ = self._prefill(self.model.embed(ids), cache, prefill_step, None)
             first.append(sample(logits).reshape(-1))
             mx.eval(first[-1], _cache_arrays(cache))
@@ -692,7 +756,7 @@ class Session:
         self.kv_bits = meta["kv_bits"]
         self.messages, self._rendered = meta["messages"], meta["rendered"]
         self.system = self.messages[0]["content"] if self.messages and self.messages[0]["role"] == "system" else None
-        st = bot.new_state(self.kv_bits)
+        st = bot.new_state(self.kv_bits or 16, passes=bot.text_config.passes_for(len(meta["caches"])))
         for i, (c, entry) in enumerate(zip(st.cache, meta["caches"])):
             kv, conv = c[0], c[1]
             if type(kv).__name__ != entry["type"]:

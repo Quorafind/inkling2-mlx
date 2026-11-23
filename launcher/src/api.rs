@@ -145,6 +145,10 @@ pub fn sampling(st: &AppState, body: &Value, max_tokens: Option<u64>, effort: Op
     if let Some(seed) = body.get("seed").and_then(Value::as_i64) {
         req["seed"] = json!(seed);
     }
+    // Loop passes for variable-loop checkpoints (an extension; OpenAI SDKs send it via extra_body).
+    if let Some(passes) = body.get("passes").and_then(Value::as_u64) {
+        req["passes"] = json!(passes);
+    }
     let stop = match body.get("stop") {
         Some(Value::String(s)) => vec![json!(s)],
         Some(Value::Array(a)) => a.iter().filter(|s| s.is_string()).cloned().collect(),

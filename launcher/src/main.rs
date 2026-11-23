@@ -77,6 +77,16 @@ struct ServeArgs {
     /// Disable DSpark speculative decoding
     #[arg(long)]
     no_spec: bool,
+    /// Loop passes (default: the checkpoint's, 3). Variable-loop checkpoints
+    /// (TML-d24-varloop-research) take 1 to 5; requests can override it with "passes"
+    #[arg(long)]
+    passes: Option<u32>,
+    /// Requests decoding at once (continuous batching; 1 = one at a time)
+    #[arg(long, default_value_t = 16)]
+    max_batch: u32,
+    /// Memory for the running batch's KV caches, GB (requests wait beyond it)
+    #[arg(long, default_value_t = 6.0)]
+    batch_gb: f64,
     /// Longest prompt + reply in tokens
     #[arg(long, default_value_t = 65536)]
     max_context: u64,
@@ -166,9 +176,14 @@ async fn serve(root: PathBuf, python: PathBuf, a: ServeArgs) -> Result<()> {
         "--kv-bits".into(), a.kv_bits.to_string(),
         "--max-context".into(), a.max_context.to_string(),
         "--cache-gb".into(), a.cache_gb.to_string(),
+        "--max-batch".into(), a.max_batch.to_string(),
+        "--batch-gb".into(), a.batch_gb.to_string(),
     ];
     if a.no_spec {
         args.push("--no-spec".into());
+    }
+    if let Some(p) = a.passes {
+        args.extend(["--passes".into(), p.to_string()]);
     }
     let addr = format!("{}:{}", a.host, a.port);
     // Bind first, so a busy port fails before the model loads.
@@ -202,7 +217,7 @@ async fn serve(root: PathBuf, python: PathBuf, a: ServeArgs) -> Result<()> {
 
     let base = format!("http://{addr}/v1");
     eprintln!(
-        "[inkling2] ready in {:.0} s: {base}  (model \"{}\", DSpark {}, KV {}-bit, dense {}-bit)\n\
+        "[inkling2] ready in {:.0} s: {base}  (model \"{}\", DSpark {}, KV {}-bit, dense {}-bit, {} pass{}{}, batch up to {})\n\
          [inkling2]   POST /v1/chat/completions   POST /v1/responses   GET /v1/models\n\
          [inkling2]   clients: OPENAI_BASE_URL={base}  OPENAI_API_KEY={}",
         t0.elapsed().as_secs_f64(),
@@ -210,6 +225,10 @@ async fn serve(root: PathBuf, python: PathBuf, a: ServeArgs) -> Result<()> {
         if info["speculative"].as_bool().unwrap_or(false) { "on" } else { "off" },
         info["kv_bits"],
         a.dense_bits,
+        info["passes"].as_u64().unwrap_or(3),
+        if info["passes"].as_u64().unwrap_or(3) == 1 { "" } else { "es" },
+        if info["varloop"].as_bool().unwrap_or(false) { ", variable-loop" } else { "" },
+        a.max_batch,
         a.api_key.as_deref().unwrap_or("local"),
     );
     axum::serve(listener, app)

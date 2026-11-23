@@ -157,9 +157,19 @@ class DSparkDrafter(_DSpark):
         if (
             cfg.hidden_size != self.config.hidden_size
             or cfg.vocab_size != self.config.vocab_size
-            or cfg.num_cache_layers != self.config.target_layer_ids[-1]
+            or self.config.target_layer_ids[-1] not in (cfg.visits(p) for p in range(1, 9))
         ):
             raise ValueError("this DSpark head does not match the Inkling 2 Mini target")
+
+    def capture_ids(self, target_config, passes):
+        """The target visits whose inputs feed the draft, for a state with `passes` loop
+        passes. The head was trained on 3-pass features ([5, 23, 41, 48]); other pass
+        counts (variable-loop checkpoints) use the corresponding visits."""
+        ids = list(self.config.target_layer_ids)
+        trained = target_config.passes_for(ids[-1])
+        if passes == trained:
+            return ids
+        return [target_config.map_visit(v, passes, trained) for v in ids]
 
     def bind_quantized(self, target_model, bits=4, group_size=64):
         self.bind(target_model)
@@ -292,8 +302,10 @@ def load_drafter(model_dir, target_model, head_bits=4, layer_bits=8):
     config = json.loads((model_dir / "config.json").read_text())
     text = dict(config["text_config"])
     target = target_model.language_model.config
-    # The draft's target_layer_ids index layer *visits*; the last one is the final state.
-    text["num_hidden_layers"] = target.num_cache_layers
+    # The draft's target_layer_ids index layer *visits* of the pass count it was trained
+    # with (3); the last one is the final state. States with other pass counts map them
+    # (DSparkDrafter.capture_ids).
+    text["num_hidden_layers"] = config["mtp_config"]["target_layer_ids"][-1]
     text["mtp_config"] = config["mtp_config"]
     drafter = DSparkDrafter(_DraftConfig(text_config=text))
     weights = mx.load(str(model_dir / "mtp.safetensors"))

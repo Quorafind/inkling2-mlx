@@ -78,6 +78,26 @@ with torch.no_grad():
     logits = model(input_ids=ids).logits.float().numpy()
 print("reference logits", logits.shape, float(np.abs(logits).mean()))
 
+
+def set_passes(n):
+    for m in [model, *model.modules()]:
+        cfg = getattr(m, "config", None)
+        for c in (cfg, getattr(cfg, "text_config", None)):
+            if c is not None and hasattr(c, "loop_num_passes"):
+                c.loop_num_passes = n
+
+
+# Other pass counts (variable-loop checkpoints choose them at inference time).
+pass_logits = {}
+with torch.no_grad():
+    for n in (1, 2, 4, 5):
+        set_passes(n)
+        pass_logits[n] = model(input_ids=ids).logits.float().numpy()
+    set_passes(3)
+    assert np.allclose(model(input_ids=ids).logits.float().numpy(), logits)
+print("reference logits at 1, 2, 4, 5 passes:",
+      ", ".join(f"{n}: {float(np.abs(v - logits).max()):.2f} from 3" for n, v in pass_logits.items()))
+
 # Multimodal: one 100x130 image -> 3x4 grid of 40px patches -> 12 image tokens.
 from mlx_vlm.models.inkling2.processing_inkling2 import Inkling2ImageProcessor  # noqa: E402
 
@@ -106,6 +126,8 @@ np.save(out / "ref_mm_logits.npy", mm_logits)
 model.save_pretrained(out, safe_serialization=True)
 np.save(out / "ref_ids.npy", ids.numpy())
 np.save(out / "ref_logits.npy", logits)
+for n, v in pass_logits.items():
+    np.save(out / f"ref_logits_p{n}.npy", v)
 
 # Rewrite config.json in the original release format that the MLX loader reads.
 release = dict(

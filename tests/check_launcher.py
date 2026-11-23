@@ -186,6 +186,31 @@ try:
     dt = time.perf_counter() - t
     check("client disconnect frees the model", s == 200 and dt < 5, f"next request done in {dt:.1f} s")
 
+    # ----------------------------------------- concurrent requests (batching)
+    import threading
+
+    sums = [(17, 25), (120, 7), (9, 33), (250, 250)]
+    spans = {}
+
+    def ask(i, a, b):
+        t0 = time.perf_counter()
+        ev, first = stream("/v1/chat/completions", {
+            "messages": [{"role": "user", "content": f"What is {a} + {b}? Reply with the number only."}],
+            "temperature": 0, "max_tokens": 400, "reasoning_effort": "none"})
+        text = "".join(ch["delta"].get("content") or "" for _, d in ev if isinstance(d, dict)
+                       for ch in d.get("choices", []))
+        spans[i] = (t0 + first, time.perf_counter(), text)
+
+    threads = [threading.Thread(target=ask, args=(i, a, b)) for i, (a, b) in enumerate(sums)]
+    for th in threads:
+        th.start()
+    for th in threads:
+        th.join()
+    right = all(str(a + b) in spans[i][2] for i, (a, b) in enumerate(sums))
+    overlap = max(s[0] for s in spans.values()) < min(s[1] for s in spans.values())
+    check("4 concurrent streams answer correctly", right, ", ".join(repr(spans[i][2].strip()) for i in range(4)))
+    check("they stream at the same time (batched)", overlap)
+
     # ------------------------------------------- turn-2 latency, long document
     doc = (ROOT / "README.md").read_text()[:24000]
     q1 = f"Here is a document:\n\n{doc}\n\nSummarize it in two sentences."

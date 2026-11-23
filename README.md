@@ -12,7 +12,12 @@ An MLX runtime for Thinking Machines' **Inkling 2 Mini**
 - **Speculative decoding.** The bundled **DSpark** draft drives speculative decoding. Each
   round's verify length comes from the draft's own token confidence (item 10), so code runs
   about 20 % faster than plain decoding and prose runs at plain speed instead of losing 5–9 %.
-- **Batching and images.** Several requests can decode in one batch, and image input works.
+- **Continuous batching and images.** The server batches concurrent requests as they arrive
+  and finish: 48 tok/s in total at 2 requests, 72 at 8 and 89 at 16, against 35 for one
+  (which keeps the single-request path with DSpark). Image input works.
+- **Variable-loop checkpoints.** `thinkingmachines/TML-d24-varloop-research` runs with 1 to 5
+  loop passes chosen per conversation (`--passes`, or `"passes"` per server request): from
+  64 tok/s at 1 pass to 22 at 5.
 - **KV reuse across turns.** Conversations keep their KV caches between turns, can be saved
   to disk, and can quantize the full-attention KV caches for very long contexts.
 
@@ -22,7 +27,8 @@ its DSpark draft network, and adds:
 
 - the loop, the message gates, the weight loader and the 48-entry cache layout;
 - visit-indexed feature capture, the speculative loop and its adaptive policy;
-- fused decode kernels, sink-slot and quantized caches, batched decoding, and multi-turn sessions.
+- fused decode kernels, sink-slot and quantized caches, continuous batching, any pass count,
+  and multi-turn sessions.
 
 ## Quick start
 
@@ -108,7 +114,12 @@ Local OpenAI-compatible server (Chat Completions + Responses), via the Rust laun
 
 ```bash
 ./inkling2                 # serves http://127.0.0.1:8000/v1; OPENAI_BASE_URL=http://127.0.0.1:8000/v1
+./inkling2 serve --max-batch 8 --batch-gb 4   # fewer requests at once / less memory for their KV
 ```
+
+Concurrent requests are batched continuously (up to `--max-batch`, 16 by default): a request
+decodes alone with DSpark while it is the only one, and joins a batch as soon as another one
+arrives. See "Several requests (batching)" under Performance.
 
 Terminal chat:
 
@@ -119,6 +130,7 @@ Terminal chat:
 .venv/bin/python chat.py --file paper.txt      # long document as context, then ask follow-ups
 .venv/bin/python chat.py --session doc.safetensors   # resume a saved conversation
 .venv/bin/python chat.py --batch prompts.txt   # one prompt per line, decoded together
+.venv/bin/python chat.py --model models/TML-d24-varloop-research --passes 2   # variable-loop checkpoint
 ```
 
 In interactive mode every turn reuses the conversation's KV caches and prefills only the new
@@ -134,6 +146,7 @@ message (see "KV cache and long contexts").
 | `--kv-bits` | Precision of the full-attention KV caches. `8` (default): affine 8-bit read by a fused decode kernel; about 22 % faster decode at 64k and half the KV memory. `16`: BF16. `4`: quarter memory, lossy. Batched decoding always uses BF16. |
 | `--no-spec` | Turns DSpark speculative decoding off. It is on by default when `mtp.safetensors` is present. |
 | `--block-size N` | Uses a fixed DSpark verify block of 2 to 8 instead of the confidence-gated policy. |
+| `--passes N` | Loop passes for new conversations (default: the checkpoint's, 3). The variable-loop checkpoint takes 1 to 5; `/passes N` switches in interactive mode and starts over. Inkling 2 Mini is only trained for 3 (it degenerates at 2 passes). |
 | `--hide-thinking`, `--temp`, `--top-p`, `--top-k`, `--seed`, `--system`, `--max-tokens` | The usual options. |
 
 From Python:
@@ -150,7 +163,54 @@ s = Session(bot, reasoning_effort="low")         # kv_bits=8 for very long conte
 s.send(open("paper.txt").read() + "\n\nSummarize section 2.")   # prefills the document once
 s.send("And section 3?")                         # prefills only this message
 s.save("paper.safetensors"); s = Session.load(bot, "paper.safetensors")
+
+vl = Inkling2Mini("models/TML-d24-varloop-research", passes=2)   # default for new states
+st = vl.new_state(passes=4)                      # or per state: the cache layout fixes it
 ```
+
+### The variable-loop research model
+
+`thinkingmachines/TML-d24-varloop-research` is a variable-loop counterpart of Inkling 2 Mini,
+released for research on looped models. Its checkpoint has exactly the same tensors,
+quantization, chat template and DSpark draft as Inkling 2 Mini, and its config differs only in
+`loop_config.is_varloop: true`. It was trained with 1 to 5 passes through the loop layers
+(post-trained at 3), and the model card warns that it may behave unpredictably at other
+counts. Download it like Mini (19.5 GB + 0.6 GB draft):
+
+```bash
+modelscope download --model thinkingmachines/TML-d24-varloop-research --local_dir models/TML-d24-varloop-research
+./inkling2 serve --model models/TML-d24-varloop-research --passes 3
+curl $OPENAI_BASE_URL/chat/completions -H 'Content-Type: application/json' \
+  -d '{"messages": [{"role": "user", "content": "Hi"}], "passes": 1}'   # per request
+```
+
+How it works here:
+
+- **The pass count lives in the cache layout.** A state for N passes has one cache per layer
+  visit, 24 + 12 (N − 1), and the forward pass reads N back from the number of caches. One
+  loaded model serves conversations at different pass counts side by side. A conversation
+  keeps its pass count: its KV belongs to those visits. The server only reuses stored states
+  of the same pass count and batches each pass count separately.
+- **DSpark at other pass counts.** The draft was trained on the features entering visits
+  `[5, 23, 41, 48]` at 3 passes: layer 5, layer 11 of pass 2, layer 17 of the last pass, and
+  the final state. At N passes they map to layer 5, layer 11 of pass N // 2 + 1 (the middle
+  one), layer 17 of the last pass, and the final state. Verification keeps the output exact
+  whatever the draft proposes; only its acceptance depends on the mapping.
+- **Speed** depends only on the architecture, so `tests/bench_passes.py` measures it with
+  Mini's weights (4k-token prompt, plain decoding, 6-bit dense):
+
+  | Passes | 1 | 2 | 3 | 4 | 5 |
+  | --- | --- | --- | --- | --- | --- |
+  | Layer visits per token | 24 | 36 | 48 | 60 | 72 |
+  | Decode, tok/s | 64.1 | 44.2 | 33.3 | 26.7 | 22.3 |
+  | Prefill, tok/s | 2,063 | 1,306 | 951 | 729 | 597 |
+  | Full-attention KV per token (8-bit) | 8.5 KB | 13 KB | 17 KB | 21 KB | 25.5 KB |
+
+  Each extra pass adds about 7.3 ms per decoded token.
+- **Checked against transformers** at 1, 2, 4 and 5 passes (`tests/check_varloop.py`: the
+  tiny reference model, FP32 on the CPU, one-shot and cached decode, ≤ 8e-5).
+- Not yet run with the varloop weights themselves; only the architecture is tested so far.
+  Quality and DSpark acceptance at each pass count are open.
 
 ## Layout
 
@@ -170,7 +230,8 @@ s.save("paper.safetensors"); s = Session.load(bot, "paper.safetensors")
 | `chat.py` | Command-line chat and batch mode |
 | `inkling2`, `launcher/` | Rust launcher and local OpenAI-compatible server. `./inkling2` builds it on first use |
 | `docs/strata-comparison.md` | Comparison with Strata (Niko1221/Strata), which also runs Inkling 2 Mini locally |
-| `inkling2_mini/server_worker.py` | The launcher's model worker: JSON lines on stdin / stdout, stored conversation states (cloned on use) with prefix matching, system-prompt snapshots |
+| `inkling2_mini/server_worker.py` | The launcher's model worker: JSON lines on stdin / stdout, the request scheduler (solo decoding with DSpark, continuous batching, chunked prefill between batch steps), stored conversation states (cloned on use) with prefix matching, system-prompt snapshots |
+| `inkling2_mini/batching.py` | Continuous batching: single-request caches ↔ one-row batch caches (8-bit KV dequantized on the way in, re-quantized on the way out), `Batch` (rows join with `extend` and leave with `extract` + `filter`, pipelined steps), per-row sampling with per-request seeds |
 | `tests/` | Parity, precision, correctness and benchmark scripts (see below) |
 | `models/Inkling-2-Mini/` | Checkpoint (not part of the code) |
 
@@ -226,15 +287,56 @@ Long contexts (8-bit dense, plain decoding):
 
 ### Several requests (batching)
 
-Aggregate decode throughput, 256-token essays, greedy:
+Decode throughput with N requests decoding together, 300-token essays, greedy, 6-bit dense.
+"Server" is the model worker with N requests sent at once (`tests/bench_server_batch.py`;
+steady state with all N rows decoding). "Static batch" is `chat_batch`
+(`tests/bench_batch.py`, 256 tokens):
 
-| Batch | 1 | 2 | 4 | 8 | 16 |
+| Requests | 1 | 2 | 4 | 8 | 16 |
 | --- | --- | --- | --- | --- | --- |
-| tok/s, all requests together | 22.9 | 33.6 | 46.5 | 61.8 | **75.6** |
-| tok/s per request | 22.9 | 16.8 | 11.6 | 7.7 | 4.7 |
+| Server: tok/s, all requests together | 35.3 | 47.7 | 57.2 | 71.7 | **89.1** |
+| Server: tok/s per request | 35.3 | 23.7 | 14.1 | 8.8 | 5.4 |
+| Server: median time to first token | 0.4 s | 0.6 s | 1.1 s | 1.8 s | 3.3 s |
+| Static batch: tok/s, all together | 30.5 | 43.8 | 57.5 | 71.9 | 89.6 |
 
-Before the grouped expert kernel, batch 16 reached 66.0 tok/s. Peak memory stays about 20 to
-22 GB.
+- One request alone keeps the single-request path (DSpark, 8-bit KV, the fused single-token
+  kernels): 35 tok/s, versus 30.5 for a batch of one. Batching wins from two requests on.
+- Peak memory stays about 20 to 21 GB at 16 rows of short context. Batch caches are BF16 and
+  left-padded to the longest row: each row costs 168 MB of sliding rings plus 32 KB per token
+  of the longest row. `--batch-gb` (6 GB) caps that; requests beyond it wait.
+- The previous measurement, before the later decode work, had 75.6 tok/s at 16 rows (66.0
+  before the grouped expert kernel).
+
+**How the server schedules** (`server_worker.py`, `batching.py`):
+
+- **Prefill is per request**, into single-request caches with the usual numerics, in
+  1,024-token chunks. Up to 25 % of each chunk's time (`--decode-share`) goes to decode steps
+  for the running rows, so their streams slow down instead of stopping while a long prompt
+  is read:
+
+  | 8k-token prompt arriving while one request streams | Time to first token | The running stream meanwhile |
+  | --- | --- | --- |
+  | `--decode-share 0` | 8.8 s | 1.3 tok/s |
+  | `--decode-share 0.25` (default) | 10.6 s | 6.6 tok/s |
+  | `--decode-share 0.5` | 12.6 s | 10.6 tok/s |
+
+  Smaller chunks cost prefill speed instead: with one decode step after each chunk, 512- and
+  256-token chunks took 11.3 and 15.4 s for the same prompt.
+- **Joining.** A request that finishes its prefill joins the running batch: its 48 caches
+  become a one-row batch cache (8-bit KV dequantized) and are appended with
+  `CacheList.extend`. A lone request that another one arrives for is paused at a token
+  boundary (`generate_tokens(should_pause=...)`; the state is then consistent, with the last
+  token pending) and moves into a batch the same way.
+- **Leaving.** A finished row is extracted back into single-request caches (8-bit KV
+  quantized again), so its conversation is stored for KV reuse like any other, and filtered
+  out of the batch. When one row is left it goes back to decoding alone. Draft features are
+  captured during batch steps, so DSpark resumes with full context.
+- **Pipelining.** Each step builds the next forward pass before reading the previous step's
+  samples. The batch keeps its next inputs as one array, the previous step's output itself:
+  per-row slices concatenated into a new array made the CPU wait for part of the current step
+  and cost 7 % at 8 rows.
+- **Sampling** is per row (temperature, top-p, top-k); rows with a seed draw from their own
+  key.
 
 ### KV cache and long contexts
 
@@ -429,7 +531,8 @@ attention. The remaining glue is roughly:
 7. **Batching.** Each request is prefilled on its own, with the same numerics as a single
    request. The 48 caches are then merged into left-padded batch caches, and all rows decode
    in lockstep. Finished rows are filtered out one step late, which keeps CPU graph building
-   overlapped with the GPU.
+   overlapped with the GPU. The server batches continuously: rows join a running batch and
+   leave it at any step (see "Several requests (batching)").
 8. **Decode glue fusion, round 2** (`decode_kernels.py`, `decode_attention.ring_decode_attention`).
    One plain decode step went from 36.3 to 33.8 ms (A/B, 4k context, minimum of 5
    interleaved runs). Contributions:
@@ -815,6 +918,8 @@ What the loop permits, measured:
 | --- | --- | --- |
 | `tests/make_tiny_reference.py` + `tests/parity_mlx.py` | A tiny random `Inkling2Loop` built with the **transformers reference**. It has 8 layers, a 2–6 × 3 loop, full and sliding layers inside and outside the loop, and an 8-token window. It is saved in the original checkpoint layout and loaded through this loader. Compared on the CPU in FP32: one-shot forward, chunked prefill + decode (rings wrap), vision tower, and image + text forward | ≤ 6e-5 relative error, argmax 100 % |
 | `tests/check_batch.py` | Tiny model, FP32, CPU. Prompts of 5, 13 and 9 tokens, caches merged (including a wrapped ring), batched teacher-forced decode with one row filtered out half way, vs each row alone | ≤ 1e-5 |
+| `tests/check_continuous_batch.py` | Tiny model, FP32, CPU. Three rows join a running batch at different steps (`extend`), leave it (`extract` + `filter`) and finish alone, with BF16-style and 8-bit full-attention KV outside the batch, vs each row alone (with the same conversions) | ≤ 3.5e-5 |
+| `tests/check_varloop.py` | Tiny model, FP32, CPU, vs transformers at 1, 2, 4 and 5 passes: one-shot forward, cached prefill + decode with caches for N passes, states of 1, 3 and 5 passes interleaved on one model, and the DSpark capture-visit mapping | ≤ 8.2e-5 |
 | `tests/check_rollback.py` | Tiny model, FP32, CPU. 18 rounds of verify-L / commit-k with interleaved single-token steps, vs plain decoding. Covers ring replay, sink-slot trim and conv-state rollback | 3e-5 |
 | `tests/test_kernels.py` | Fused attention-residual kernel (GPU) vs an exact FP32 CPU reference | ≤ 1.2e-6 |
 | `tests/test_grouped.py` | Grouped NVFP4 kernel vs `gather_qmm` on real experts, plus timing | bit-identical |
@@ -841,7 +946,8 @@ What the loop permits, measured:
 | `tests/check_gated_spec.py` | Real weights, confidence-gated DSpark: draft-feature bookkeeping (draft KV offset + pending features = target length, after generations with plain fallbacks and across two turns), and greedy output vs plain decoding with the margin at the first divergence | bookkeeping exact; divergences at near-ties only (margins 0.00–0.16) |
 | `tests/bench_spec_policy.py` | End-to-end plain vs geometric vs confidence-gated DSpark, prose and code, T = 0 / 1 | see Performance, item 10 |
 | `tests/check_server_worker.py` | Worker protocol on real weights. Turn 2 with the history echoed as clients send it reuses turn 1's KV, two clones of one stored state give token-identical output, a long system prompt is snapshotted and reused, plus tool calls, stop sequences and cancel | all pass; snapshot hit 1,045 of 1,052 tokens |
-| `tests/check_launcher.py`, `tests/check_launcher_sdk.py` | The Rust launcher end to end over HTTP, and with the official `openai` SDK: both APIs streaming and not, tool calls, `previous_response_id`, GET / DELETE, disconnect cancels, errors, turn-2 latency | all pass; turn 2 of an 8k conversation 9.25 s cold → 0.29–0.32 s |
+| `tests/check_server_batching.py` | Continuous batching in the worker, real weights: six requests at once (known answers, numbered lists), follow-up turns that read a batched reply back from the stored KV, a lone request that gets company mid-stream (alone → batch → alone) and whose list is read back afterwards, cancel and stop sequences inside a batch | all pass; batch of 6 |
+| `tests/check_launcher.py`, `tests/check_launcher_sdk.py` | The Rust launcher end to end over HTTP, and with the official `openai` SDK: both APIs streaming and not, tool calls, `previous_response_id`, GET / DELETE, disconnect cancels, errors, four concurrent streams, turn-2 latency | all pass; turn 2 of an 8k conversation 9.25 s cold → 0.29–0.32 s |
 | `tests/check_screened_draft.py` | Screened vs full-vocabulary Markov drafting on the same draft features every round (prose and code, T = 0 / 1): draft agreement up to BF16 ties in the reference, shortlist coverage, confidence difference, Markov-loop time | 256 × top-16: 98.8 % agreement, 1.6 vs 2.6 ms |
 | `tests/trace_spec.py` + `tests/sim_spec_policy.py` | Fixed-block-8 DSpark traces (per-position draft probability, accepted count, draft / verify time, the V(L) curve), and a replay of verify-length policies on them, including an oracle | see Performance, item 10 |
 | `tests/bench_*.py`, `tests/profile_decode.py`, `tests/decode_breakdown.py` | Speed tables, the decode breakdown, and each part of a step against its byte floor | numbers above |
@@ -908,6 +1014,13 @@ What the loop permits, measured:
 - **Multi-turn reuse depends on the chat template being append-only per message.** It is,
   including the reasoning-effort message, which is emitted once before the first non-system
   message. `Session` checks the prefix and falls back to a full prefill if it does not hold.
+- **The CPU tests do not run the Metal kernels.** `check_batch.py` and the other tiny-model
+  tests run on the CPU, where the fused kernels are off. The decode fusions' depth-mix kernel
+  reshaped its outputs to batch 1, which broke every batch of 2 or more (and so the batch API)
+  until it was found by `tests/bench_batch.py`. After kernel changes, run a GPU batch too.
+- **Reasoning re-attachment is keyed by the reply text.** Replies cut off during thinking all
+  have empty content and share a key, so the latest one's reasoning gets attached. Such a
+  follow-up turn then renders differently from the stored state and is prefilled cold.
 - The system Python here is 3.15. Use a 3.12 venv for MLX wheels.
 
 ## Not done / next steps
@@ -918,12 +1031,12 @@ What the loop permits, measured:
 - Decode-time band attention. Single-token decode still builds a small 1 × context mask per
   full visit, which is cheap next to reading the KV.
 
-- A server with *continuous* batching: admit new requests into the running batch with
-  `CacheList.extend`. The batch API here is static.
 - DSpark inside batches (ragged acceptance per row).
+- Batch decoding over the 8-bit KV and without left padding. Batch caches are BF16 and
+  padded to the longest row, so one long conversation makes every row attend over its length.
+- Prefill and decode in one forward pass (vLLM-style mixed batches) instead of alternating.
 - A grouped MXFP8 expert kernel. Layers 20–23 (4 of 48 visits) still use `gather_qmm`.
 - Faster fused kernels for the remaining per-visit glue, and a grouped kernel that reaches the
   bandwidth ceiling.
-- The variable-loop research model `thinkingmachines/TML-d24-varloop-research` can run with
-  1 or 2 passes for speed. It is a different checkpoint and is not supported here
-  (`is_varloop`).
+- Run the variable-loop checkpoint's weights: quality and DSpark acceptance per pass count,
+  and whether another visit mapping drafts better at 1, 2, 4 and 5 passes.

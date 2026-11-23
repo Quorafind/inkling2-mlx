@@ -178,9 +178,43 @@ class TextConfig(Inkling2TextConfig):
         return self.loop_end - self.loop_start
 
     @property
+    def is_varloop(self) -> bool:
+        """Variable-loop checkpoints (TML-d24-varloop-research) were trained with 1 to 5
+        passes; the pass count is chosen at inference time."""
+        return bool(self.loop_config.get("is_varloop", False))
+
+    @property
     def num_cache_layers(self) -> int:
         """One KV + conv cache per layer *application* (48 for the release)."""
-        return self.num_hidden_layers + (self.num_passes - 1) * self.num_loop_layers
+        return self.visits(self.num_passes)
+
+    def visits(self, passes) -> int:
+        """Layer applications per token with `passes` loop passes (24 + 12 (passes - 1))."""
+        return self.num_hidden_layers + (passes - 1) * self.num_loop_layers
+
+    def passes_for(self, num_caches) -> int:
+        """The pass count a cache list of this length belongs to."""
+        p, rest = divmod(num_caches - self.num_hidden_layers, self.num_loop_layers)
+        if rest or p < 0:
+            raise ValueError(f"{num_caches} caches do not match any pass count")
+        return p + 1
+
+    def map_visit(self, visit, passes, trained_passes=None):
+        """Translates a visit index of the trained pass count (3) to `passes` passes, for
+        the DSpark draft's target features: pre-loop visits and the final state keep
+        their meaning, the last loop pass maps to the last pass, and earlier loop passes
+        to the middle pass (passes // 2; 1 of 0..2 for three)."""
+        trained = trained_passes or self.num_passes
+        L, s, n = self.num_hidden_layers, self.loop_start, self.num_loop_layers
+        if visit < s:
+            return visit
+        if visit >= self.visits(trained):  # the final normalized state
+            return self.visits(passes)
+        if visit >= s + trained * n:  # post-loop layers
+            return visit + (passes - trained) * n
+        p, j = divmod(visit - s, n)
+        p = passes - 1 if p == trained - 1 else min(passes // 2, passes - 1)
+        return s + p * n + j
 
 
 @dataclass
@@ -193,8 +227,6 @@ class ModelConfig:
     @classmethod
     def from_dict(cls, d: dict) -> "ModelConfig":
         text = TextConfig.from_dict(d.get("text_config", {}))
-        if text.loop_config.get("is_varloop"):
-            raise NotImplementedError("variable-loop checkpoints are not supported")
         vision = VisionConfig.from_dict(d.get("vision_config", {}))
         vision.text_hidden_size = text.hidden_size
         vision.out_hidden_size = text.hidden_size
@@ -480,7 +512,10 @@ class TextModel(nn.Module):
 
     def _forward(self, x, cache, capture):
         cfg = self.config
-        caches = cache if cache is not None else [None] * cfg.num_cache_layers
+        # The pass count follows the cache layout (one cache per layer visit), so states
+        # made for different pass counts can share the weights.
+        passes = cfg.passes_for(len(cache)) if cache is not None else cfg.num_passes
+        caches = cache if cache is not None else [None] * cfg.visits(passes)
         start, end = cfg.loop_start, cfg.loop_end
         wanted = set(capture or ())
         captured = {}
@@ -505,7 +540,7 @@ class TextModel(nn.Module):
         for i in range(start, end):
             x = run(i, x, blocks, caches[i])
 
-        for p in range(1, cfg.num_passes):
+        for p in range(1, passes):
             # Skip the block appended at the loop entry: it is pre_x on every pass.
             blocks_prev, x_prev = blocks[num_pre_blocks + 1 :], x
             x, blocks = pre_x, list(pre_blocks)
@@ -563,12 +598,14 @@ class LanguageModel(nn.Module):
             h = h[:, -1:]
         return self.logits(h)
 
-    def make_cache(self, kv_bits=None):
+    def make_cache(self, kv_bits=None, passes=None):
         """kv_bits: quantize the full-attention visits' K/V (8 or 4); None = BF16.
-        Sliding-window visits are capped at 1024 tokens and stay BF16."""
+        Sliding-window visits are capped at 1024 tokens and stay BF16.
+        passes: loop passes (default: the config's); the forward pass reads it back
+        from the number of caches."""
         cfg = self.config
         caches = []
-        for app in range(cfg.num_cache_layers):
+        for app in range(cfg.visits(passes or cfg.num_passes)):
             layer = (
                 app
                 if app < cfg.num_hidden_layers
@@ -604,5 +641,5 @@ class Model(nn.Module):
             h = masked_scatter(h, mx.broadcast_to(slots[..., None], h.shape), features)
         return h
 
-    def make_cache(self, kv_bits=None):
-        return self.language_model.make_cache(kv_bits)
+    def make_cache(self, kv_bits=None, passes=None):
+        return self.language_model.make_cache(kv_bits, passes)

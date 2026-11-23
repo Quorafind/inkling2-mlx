@@ -92,6 +92,9 @@ def main():
                          "decode at 64k, half the memory), 16 = BF16, 4 = lossy")
     ap.add_argument("--no-spec", action="store_true", help="disable DSpark speculative decoding")
     ap.add_argument("--block-size", type=int, help="fixed DSpark verify block 2-8 (default: adaptive)")
+    ap.add_argument("--passes", type=int,
+                    help="loop passes (default: the checkpoint's, 3); variable-loop checkpoints "
+                         "(TML-d24-varloop-research) take 1-5. Interactive: /passes N starts over with N")
     ap.add_argument("--dense-bits", type=int, choices=[4, 5, 6, 8, 16], default=6,
                     help="attention projections + lm_head precision: 6 (default, at the model's own "
                          "BF16 noise, fastest), 8 = near-lossless, 16 = the checkpoint's native BF16, "
@@ -103,7 +106,7 @@ def main():
     from inkling2_mini.generate import Inkling2Mini
 
     bot = Inkling2Mini(args.model, speculative=not args.no_spec and not args.batch, dense_bits=args.dense_bits,
-                       kv_bits=args.kv_bits)
+                       kv_bits=args.kv_bits, passes=args.passes)
     history = [{"role": "system", "content": args.system}] if args.system else []
 
     if args.batch:
@@ -131,7 +134,7 @@ def main():
         run_turn(session, prefix + args.prompt, images, args)
         return
 
-    print("Inkling 2 Mini — /reset, /save PATH, /load PATH, /quit"
+    print("Inkling 2 Mini — /reset, /save PATH, /load PATH, /passes N, /quit"
           + (f"  (session with {session.context_tokens} tokens loaded)" if args.session else ""))
     while True:
         try:
@@ -154,6 +157,16 @@ def main():
         if text.startswith("/load "):
             session = Session.load(bot, text[6:].strip())
             print(f"(loaded {session.context_tokens} tokens of context)")
+            continue
+        if text.startswith("/passes"):
+            # The KV of a conversation belongs to its pass count's layer visits: start over.
+            try:
+                bot.passes = bot.check_passes(text.split()[1])
+            except (IndexError, ValueError) as e:
+                print(f"({e or 'usage: /passes N'}; now {bot.passes})")
+                continue
+            session.reset()
+            print(f"({bot.passes} pass{'es' if bot.passes > 1 else ''}; history cleared)")
             continue
         run_turn(session, prefix + text, None, args)
         prefix = ""

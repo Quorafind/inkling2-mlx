@@ -203,7 +203,7 @@ Decode throughput in tok/s over 300-token generations:
 
 - This table predates the second round of decode glue fusion ("What was done", item 8) and
   the 6-bit default (item 9). Plain decoding is now about 31 tok/s at 8-bit dense and about
-  34 tok/s at the 6-bit default on these prompts.
+  32–34 tok/s at the 6-bit default on these prompts (item 11).
 - Ranges come from repeated runs. Greedy text, and so DSpark acceptance, changes with tiny
   numeric differences between runs.
 - Since the decode fusions, plain decoding is fast enough that DSpark only pays on
@@ -362,13 +362,14 @@ attention. The remaining glue is roughly:
   about 140 GB/s. mlx-swift-lm PR #821 reports a measured 155 GB/s on the same machine. At
   140 GB/s the 6-bit default's floor is about 25 to 27 ms per token, and plain decoding runs
   at 29.5 to 31 ms (32 to 34 tok/s), about 85 to 90 % of it.
-  - `tests/decode_breakdown.py` splits the step by removing parts of it. Skipping the routed
-    experts saves about 17 ms, against a byte floor of about 13 ms for their 1.84 GB, so the
-    expert path (router, top-k, two `gather_qmm`, SwiGLU, weighted sum) reads at about
-    105 GB/s. The dense layers, attention and glue take about 12.5 ms at both 6 bits
-    (1.34 GB) and 4 bits (1.02 GB): that part is bound by latency, not bytes.
-  - The latency is the serial chain of about 20 dependent kernels per visit, 48 visits per
-    token. Each dependent dispatch costs about 3.5 µs on this GPU.
+  - `tests/decode_breakdown.py` splits the step by removing parts of it. The dense layers,
+    attention and glue take about 12.5 ms at both 6 bits (1.34 GB) and 4 bits (1.02 GB):
+    that part is bound by latency, not bytes. The routed experts read at about 125–130 GB/s
+    in their dependent chain (`tests/bench_moe_decode.py`). Before the three-kernel MoE
+    (item 11) the router and the separate conv added about 2 ms per token on top.
+  - The latency is the serial chain of dependent kernels: one decode step builds about
+    1,900 graph nodes, about 1,300 of them kernels. A dependent dispatch costs 3.5 µs at
+    best on this GPU, and 5–10 µs for the small GEMVs and glue kernels in the chain.
   - Thinking Machines' chart is a theoretical ceiling at 614 GB/s (M5 Max class).
 - **Batching reads each weight once per step for all rows.** The cost grows with the number of
   *distinct* experts the rows touch: about 39 of 128 per visit for 16 rows. MLX's
@@ -588,11 +589,51 @@ attention. The remaining glue is roughly:
       bounded by the union of experts it touches. The bundled draft also accepts much less on
       prose.
 
+11. **One decode token's MoE in three kernels (`moe_kernels.py`, 2026-11-23).** The router
+    GEMV, top-k, gate/up, SwiGLU, down, the weighted route sum, the 4-tap short convolution
+    after the MoE and the residual add were six kernels per visit on the NVFP4 layers and about
+    ten on the four MXFP8 layers (20–23), which fell back to `gather_qmm`. Now they are three
+    on every layer:
+    - a router GEMV that reads the BF16 router weight directly (no FP32 copy, no cast of the
+      input);
+    - gate/up + softcapped SwiGLU, where every simdgroup also runs the top-k itself (sigmoid,
+      bias, ties to the lower expert, normalized weights), so there is no routing kernel;
+    - down + the weighted sum + the short conv + residual + the next conv state.
+
+    The same kernels read NVFP4 and MXFP8. Each lane loads 16 or 32 quantized values per row
+    at once and the FP4 / FP8 decode folds its constant factor into the group scale. That part
+    is worth only about 3 %: the expert kernels were already near what a dependent chain of
+    kernels reads on this GPU (about 125–130 GB/s).
+
+    `tests/bench_moe_decode.py`, 48 visits of one token: the MoE + conv + residual tail goes
+    from 17.2 to 15.3 ms, and the router alone from 2.1 to 1.1 ms. Decode, 300-token greedy
+    generations, best of 2, two alternating rounds:
+
+    | 6-bit dense (tok/s) | code: plain | story: plain | zh: plain | code: DSpark |
+    | --- | --- | --- | --- | --- |
+    | before | 30.6 – 31.0 | 29.4 – 30.6 | 30.0 – 31.0 | 38.3 – 38.8 |
+    | three-kernel MoE | 31.5 – 32.9 | 32.5 – 32.8 | 32.3 – 32.5 | 40.8 – 41.1 |
+
+    At 4-bit dense: 35.1–35.3 → 36.6–37.4 tok/s. At BF16 dense: 21.6–22.6 → 22.6–23.2.
+
+    - Speculative verification routes its tokens with the same router GEMV and top-k code
+      (`moe_kernels.route`), so a token picks the same experts whichever path computes it. With
+      the new decode router but the old verify router, greedy DSpark output diverged from
+      plain decoding at a 0.52 logit margin in `tests/check_gated_spec.py`. With the shared
+      router it passes and diverges later than before: only at near-ties (0.035, 0.072,
+      0.076), at tokens 83 / 191 / 97 instead of 63 / 15 / 97.
+    - Precision against CPU-FP32 truth over 437 single-token decode positions (the
+      `tests/dense_precision.py` text): mean KL 8.0e-3 → 9.0e-3, median 3.8e-3 → 3.0e-3, top-1
+      94.7 % either way. The routes follow a different FP32 summation order, so near-tie
+      expert choices flip in both directions. That shows up as a few larger outliers and a
+      lower median.
+    - `moe_kernels.ENABLED = False` restores the previous path for A/B tests.
+
 ### Hardware utilization and the loop
 
 | Regime | Utilization | Bottleneck |
 | --- | --- | --- |
-| Decode, one request | About 85 to 90 % of measured bandwidth (6-bit dense: 3.8 GB per token in 29.5 to 31 ms at 4k context, vs about 27 ms at 140 GB/s; the spec is 170 GB/s), about 2 % of compute | Reading weights, plus about 3 to 4 ms in the expert path above its byte floor and about 3 ms of serial small-kernel latency in the dense part |
+| Decode, one request | About 85 to 90 % of measured bandwidth (6-bit dense: 3.8 GB per token in about 29.5 to 31 ms at 4k context, vs about 27 ms at 140 GB/s; the spec is 170 GB/s), about 2 % of compute | Reading weights, plus about 3 ms of serial small-kernel latency in the dense part and the attention glue |
 | Prefill | About 5.6 TFLOPS effective. The NVFP4 expert and 8-bit dense GEMMs themselves run at 12–15 TFLOPS, so about half the time is spent outside them | Non-GEMM work: route sort / gather / scatter, sliding-layer masks, short convolutions, small ops |
 | Batch of 16 | 76 tok/s in total | The union of distinct experts per visit |
 
@@ -653,19 +694,31 @@ What the loop permits, measured:
   adds a BF16 rounding of the shifted mask, about 2.5 ulp. The sink-slot caches do the same
   job exactly.
 - **4-bit dense layers.** `--dense-bits 4` reads 3.12 GB per token instead of 3.56 (KV
-  excluded), but in the same run plain decoding only goes from 31.2 to 29.4 ms per token
-  (32.1 → 34.0 tok/s, `tests/decode_breakdown.py`), because the dense part is latency-bound.
-  It also costs precision: mean KL against CPU-FP32 truth 0.029 instead of 8.2e-3, top-1
-  89.5 % instead of 95.0 %. mlx-swift-lm PR #821 decodes the same model with 4-bit dense
-  layers and the same native NVFP4 / MXFP8 experts at 43.7 tok/s short, 40.2 at 3.3K and
-  36.7 at 13K; this runtime gets about 34, 33.3 and 31.7.
-  - The PR runs the decode experts as two fused kernels (gate/up with the softcapped SwiGLU;
-    down with the weighted sum, short convolution and residual) that read NVFP4 / MXFP8
-    directly at 135 to 150 GB/s, and each sublayer as a few fused kernels. Here the expert
-    path reads at about 105 GB/s and the dense part is a chain of about 20 kernels per visit.
-    Fusing those, not fewer bits, is what closes the gap.
-  - The gap narrows with context: from short to 13K the PR's step grows by 4.4 ms, this one by
-    about 2 ms (8-bit KV and the split-K decode attention).
+  excluded), but plain decoding only gains about 6–8 % over 6 bits, because the dense part is
+  latency-bound. It also costs precision: mean KL against CPU-FP32 truth 0.029 instead of
+  8.2e-3, top-1 89.5 % instead of 95.0 %.
+- **mlx-swift-lm PR #821, measured on this machine.** The PR reports 43.7 tok/s on an M6 Mac
+  mini with `mlx-community/Inkling-2-Mini-4bit`. Its branch (ba8b1af) was built here and run
+  on the same prompt token ids (300 greedy tokens, best of 3):
+
+  | | code | story | zh |
+  | --- | --- | --- | --- |
+  | PR, official checkpoint (BF16 dense) | 24.1 | 23.1 | 22.8 |
+  | This runtime, BF16 dense | 22.6 | 23.2 | 23.2 |
+  | PR, mlx-community 4-bit | 40.3 | 39.5 | 39.9 |
+  | This runtime, 4-bit dense | 37.4 | 36.6 | 36.6 |
+  | This runtime, 4-bit dense, before item 11 | 35.3 | 35.2 | 35.1 |
+
+  - The 4-bit checkpoint reads about the same bytes per token as this runtime's 4-bit dense
+    (3.06 vs 3.12 GB). Its experts keep the native NVFP4 / MXFP8, and the attention
+    projections and lm_head are affine 4-bit with group 64, as here. So its precision cost
+    is the 4-bit one above; the PR reports no precision numbers.
+  - The 43.7 does not reproduce here (about 40). At BF16, where bytes dominate, the two
+    runtimes are level. At 4 bits the PR is about 8 % ahead, because it runs each sublayer's
+    glue (attention prologue, depth mix, message controllers, decode attention, expert
+    epilogue) as a few fused kernels, while this runtime still has about 1,300 kernels per
+    token. Its expert kernels have the same structure as this runtime's and read at the same
+    rate.
 - **Removing graph nodes buys little by itself.** About 3,600 fewer nodes saved about 2 ms,
   because most of them were views or tiny kernels.
 - **Don't misread ablations:**

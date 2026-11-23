@@ -38,6 +38,7 @@ from mlx_vlm.models.switch_layers import SwitchLinear, _gather_sort, _scatter_un
 
 from . import kernels
 from . import decode_kernels
+from . import moe_kernels
 from . import prefill_kernels
 from .caches import QuantSinkKVCache, SinkKVCache, SinkRingKVCache
 from .fused import FusedAttention, gates, stack_gates
@@ -74,6 +75,10 @@ class GroupedSparseMoE(SparseMoE):
         return ok
 
     def _route(self, x, tokens):
+        if tokens <= 64 and decode_kernels.active() and moe_kernels.route_ok(self, x):
+            # the same router GEMV + top-k as the fused single-token kernels, so verification
+            # passes route each token exactly like decode does
+            return moe_kernels.route(x, self.gate_weight, self.e_score_correction_bias, self.top_k, self.route_scale)
         if tokens <= 64 and decode_kernels.active():
             wt = getattr(self, "_gate_t32", None)
             if wt is None or wt.shape[0] != x.shape[-1]:
@@ -343,7 +348,19 @@ class Layer(DecoderLayer):
         return self._mlp_tail(x, residual, hidden, conv, mask, dtype)
 
     def _mlp_tail(self, x, residual, hidden, conv, mask, dtype):
-        out = self.mlp_sconv(self.mlp(hidden), conv, mask, residual=residual, out_dtype=dtype)
+        sc = self.mlp_sconv
+        if (sc.kernel_size == 4 and moe_kernels.fused_ok(self.mlp, hidden)
+                and prefill_kernels.conv_fast_ok(hidden, conv, mask)):
+            # one decode token: route, experts, weighted sum, short conv and residual in three
+            # kernels (moe_kernels.moe_decode_conv)
+            state = conv[sc.conv_idx] if conv is not None else None
+            if state is None:
+                state = mx.zeros((1, 3, hidden.shape[-1]), mx.float32)
+            out, nstate = moe_kernels.moe_decode_conv(hidden, self.mlp, state, sc.conv.weight, residual, dtype)
+            if conv is not None:
+                conv[sc.conv_idx] = nstate
+        else:
+            out = sc(self.mlp(hidden), conv, mask, residual=residual, out_dtype=dtype)
         if conv is not None:
             conv.advance(x.shape[1])
         return out

@@ -13,15 +13,17 @@ MXFP8 layers, which fell back to gather_qmm):
 route() runs the same router GEMV and top-k code for multi-token passes, so speculative
 verification picks exactly the experts single-token decode would.
 
-* Each lane reads P quantized values per row and step (16 or 32 values: 8-16 bytes of FP4,
-  16-32 of FP8) instead of 8 values.
-* FP4 and FP8 decode through `half` bit patterns (as MLX does), with the constant factor
-  (2^14 for e2m1, 2^8 for e4m3) folded into the group scale.
 * The same kernels read NVFP4 (group 16, E4M3 scales, per-expert global scale) and MXFP8
   (group 32, E8M0 scales).
+* The dot products follow MLX's qmv order (8 values per lane step, 256 per simdgroup step,
+  for NVFP4 and MXFP8 alike) and the route sum is the FMA chain of
+  prefill_kernels.combine_routes, so the output matches route + gather_qmm + combine, which
+  verification uses, up to one or two BF16 steps on a handful of values per layer (as the
+  previous single-token kernel did). Wider loads (16 or 32 values per lane) read about 3 %
+  faster, but decode and verification then drift further apart.
 
-Each expert output is still rounded to the model dtype before the SwiGLU and before the
-weighted route sum, as in the reference; only FP32 summation orders differ.
+Each expert output is rounded to the model dtype before the SwiGLU and before the weighted
+route sum (in route order), as in the reference.
 """
 
 import math
@@ -29,65 +31,6 @@ import math
 import mlx.core as mx
 
 _k = {}
-
-_HEADER = r"""
-#include <metal_stdlib>
-using namespace metal;
-
-// e2m1 nibble -> half holding value / 2^14 (sign included)
-inline float fp4h(uint n) {
-    return float(as_type<half>(ushort(((n & 8u) << 12) | ((n & 7u) << 9))));
-}
-
-// e4m3 byte -> half holding value / 2^8
-inline float fp8h(uint b) {
-    ushort v = b & 127u;
-    ushort u = (v << 7) | (((v + 1) >> 7) << 14) | ushort((b & 128u) << 8);
-    return float(as_type<half>(u));
-}
-
-// group scale, including the 2^14 / 2^8 folded out of the values
-template <int BITS>
-inline float group_scale(uint8_t s) {
-    if (BITS == 4) {  // NVFP4: E4M3 scale per 16
-        return fp8h(s) * (256.0f * 16384.0f);
-    }
-    // MXFP8: E8M0 scale per 32
-    return as_type<float>(s == 0 ? 0x400000u : (uint(s) << 23)) * 256.0f;
-}
-
-// dot of P quantized values at w (P/2 or P bytes) with xv, scaled per group
-template <int BITS, int P>
-inline float qdot_p(const device uint8_t* w, const device uint8_t* s, thread const float* xv) {
-    constexpr int GS = BITS == 4 ? 16 : 32;
-    float total = 0.0f;
-    if (BITS == 4) {
-        // P / 8 words of 8 values
-        for (int g = 0; g < P / GS; ++g) {
-            float acc = 0.0f;
-            for (int q = 0; q < GS / 8; ++q) {
-                uint word = ((const device uint*)w)[g * (GS / 8) + q];
-                for (int i = 0; i < 8; ++i)
-                    acc = fma(xv[g * GS + q * 8 + i], fp4h(word >> (4 * i)), acc);
-            }
-            total = fma(acc, group_scale<4>(s[g]), total);
-        }
-    } else {
-        constexpr int G = P < GS ? 1 : P / GS;   // groups in this chunk
-        constexpr int PER = P < GS ? P : GS;     // values per group in this chunk
-        for (int g = 0; g < G; ++g) {
-            float acc = 0.0f;
-            for (int q = 0; q < PER / 4; ++q) {
-                uint word = ((const device uint*)w)[g * (PER / 4) + q];
-                for (int i = 0; i < 4; ++i)
-                    acc = fma(xv[g * PER + q * 4 + i], fp8h(word >> (8 * i)), acc);
-            }
-            total = fma(acc, group_scale<8>(s[g]), total);
-        }
-    }
-    return total;
-}
-"""
 
 # Router logits: one simdgroup per expert row, BF16 x and BF16 router weight, FP32 sums
 # (the reference computes an FP32 GEMV of the same BF16 values; only the summation order
@@ -168,10 +111,8 @@ _UP = r"""
     }
     int row0 = (threadgroup_position_in_grid.x * NSG + sg) * RPS;
     uint expert = sel_idx[route];
-    constexpr int GS = BITS == 4 ? 16 : 32;
     constexpr int KB = K * BITS / 8;     // bytes per row
     constexpr int KS = K / GS;           // scales per row
-    constexpr int U = K / P;             // chunks per row
     constexpr int N = 2 * INTER;
     const device uint8_t* wg_ = (const device uint8_t*)w + size_t(expert) * N * KB + size_t(row0) * KB;
     const device uint8_t* wu_ = wg_ + size_t(INTER) * KB;
@@ -179,13 +120,16 @@ _UP = r"""
     const device uint8_t* su0 = sg0 + size_t(INTER) * KS;
     float rg[RPS], ru[RPS];
     for (int r = 0; r < RPS; ++r) { rg[r] = 0.0f; ru[r] = 0.0f; }
-    for (int u = lane; u < U; u += 32) {
-        float xv[P];
-        for (int i = 0; i < P; ++i) xv[i] = float(x[u * P + i]);
-        const int sb = u * P / GS;
+    // MLX's fp_qmv_impl order (gather_qmm): 32 / BITS values per lane step
+    constexpr int VPT = 8, BLOCK = VPT * 32, FULL = (K / BLOCK) * BLOCK, TAIL = K - FULL;  // MLX qmv order
+    thread float xt[VPT];
+    for (int k = 0; k < FULL + (TAIL > 0 ? BLOCK : 0); k += BLOCK) {
+        if (k == FULL && int(lane) >= TAIL / VPT) break;
+        load_vector<T, float, VPT>(x + lane * VPT + k, xt);
+        const int u = (k + lane * VPT) / VPT;  // this lane's chunk of VPT values (4 bytes)
         for (int r = 0; r < RPS; ++r) {
-            rg[r] += qdot_p<BITS, P>(wg_ + r * KB + u * (P * BITS / 8), sg0 + r * KS + sb, xv);
-            ru[r] += qdot_p<BITS, P>(wu_ + r * KB + u * (P * BITS / 8), su0 + r * KS + sb, xv);
+            rg[r] += qdot<float, VPT, BITS>(wg_ + r * KB + u * VPT * BITS / 8, xt, dequantize_scale<float, GS>(sg0[r * KS + u * VPT / GS]));
+            ru[r] += qdot<float, VPT, BITS>(wu_ + r * KB + u * VPT * BITS / 8, xt, dequantize_scale<float, GS>(su0[r * KS + u * VPT / GS]));
         }
     }
     const float gscale = HAS_GS ? g[expert] / (448.0f * 6.0f) : 1.0f;
@@ -209,21 +153,21 @@ _DOWN = r"""
     uint lane = thread_index_in_simdgroup, j = simdgroup_index_in_threadgroup;
     int row0 = threadgroup_position_in_grid.x * ROWS;
     uint expert = ids[j];
-    constexpr int GS = BITS == 4 ? 16 : 32;
     constexpr int KB = K * BITS / 8;
     constexpr int KS = K / GS;
-    constexpr int U = K / P;
     const device uint8_t* w0 = (const device uint8_t*)w + size_t(expert) * N * KB + size_t(row0) * KB;
     const device uint8_t* s0 = s + size_t(expert) * N * KS + size_t(row0) * KS;
     const device T* xr = act + j * K;
     float res[ROWS];
     for (int r = 0; r < ROWS; ++r) res[r] = 0.0f;
-    for (int u = lane; u < U; u += 32) {
-        float xv[P];
-        for (int i = 0; i < P; ++i) xv[i] = float(xr[u * P + i]);
-        const int sb = u * P / GS;
+    constexpr int VPT = 8, BLOCK = VPT * 32, FULL = (K / BLOCK) * BLOCK, TAIL = K - FULL;  // MLX qmv order
+    thread float xt[VPT];
+    for (int k = 0; k < FULL + (TAIL > 0 ? BLOCK : 0); k += BLOCK) {
+        if (k == FULL && int(lane) >= TAIL / VPT) break;
+        load_vector<T, float, VPT>(xr + lane * VPT + k, xt);
+        const int u = (k + lane * VPT) / VPT;
         for (int r = 0; r < ROWS; ++r)
-            res[r] += qdot_p<BITS, P>(w0 + r * KB + u * (P * BITS / 8), s0 + r * KS + sb, xv);
+            res[r] += qdot<float, VPT, BITS>(w0 + r * KB + u * VPT * BITS / 8, xt, dequantize_scale<float, GS>(s0[r * KS + u * VPT / GS]));
     }
     const float gscale = HAS_GS ? g[expert] / (448.0f * 6.0f) : 1.0f;
     threadgroup float part[KE][ROWS];
@@ -235,7 +179,7 @@ _DOWN = r"""
     if (j == 0 && lane < ROWS) {
         const int d = row0 + lane;
         float acc = 0.0f;
-        for (int k = 0; k < KE; ++k) acc += float(wts[k]) * part[k][lane];
+        for (int k = 0; k < KE; ++k) acc = fma(float(wts[k]), part[k][lane], acc);  // as combine_routes (verify)
         const float x0 = float(T(acc));
         const float xm3 = state[d], xm2 = state[N + d], xm1 = state[2 * N + d];
         const float c = float(cw[d * 4 + 0]) * xm3 + float(cw[d * 4 + 1]) * xm2
@@ -265,14 +209,27 @@ def supports(sw):
 
 
 def _global_scale(linear):
-    from mlx_vlm.models.masked_quantized import _global_scale as gsc
+    """mlx-vlm's per-expert NVFP4 global scale, computed once per layer and kept (mlx-vlm
+    recomputes it, one small kernel, on every call)."""
+    gs = getattr(linear, "_mk_global_scale", None)
+    if gs is None:
+        from mlx_vlm.models.masked_quantized import _global_scale as gsc
 
-    return gsc(linear)
+        gs = gsc(linear)
+        mx.eval(gs)
+        object.__setattr__(linear, "_mk_global_scale", gs)
+    return gs
 
 
 # tuned on an M6 (tests/bench_moe_decode.py); differences between the good configs are ~2 %
-CONFIG = dict(P_UP=32, RPS=1, NSG=2, P_DOWN=16, ROWS=2)
+CONFIG = dict(RPS=1, NSG=2, ROWS=2)
 ROUTER_NSG = 4
+
+
+def _mlx_header():
+    from mlx_vlm.models.masked_quantized import _HEADER as h
+
+    return h
 
 
 def _kernels(gate_cap, up_cap, route_scale, top_k, n_experts):
@@ -282,11 +239,11 @@ def _kernels(gate_cap, up_cap, route_scale, top_k, n_experts):
               .replace("UCAP", f"{float(up_cap):.9e}f").replace("SCALE", f"{float(route_scale):.9e}f"))
         _k[key] = (
             mx.fast.metal_kernel(name="inkling_moe_up_routed", input_names=["x", "logits", "bias", "w", "s", "g"],
-                                 output_names=["act", "ids_out", "wts_out"], header=_HEADER, source=up,
+                                 output_names=["act", "ids_out", "wts_out"], header=_mlx_header(), source=up,
                                  compile_options={"math_mode": "safe"}),
             mx.fast.metal_kernel(name="inkling_moe_down_conv",
                                  input_names=["act", "w", "s", "g", "ids", "wts", "state", "cw", "resid"],
-                                 output_names=["out", "nstate"], header=_HEADER,
+                                 output_names=["out", "nstate"], header=_mlx_header(),
                                  source=_DOWN.replace("CONV_SCALE", f"{math.sqrt(5):.9e}f"),
                                  compile_options={"math_mode": "safe"}),
         )
@@ -315,8 +272,8 @@ def moe_decode_conv(hidden, moe, conv_state, conv_weight, residual, out_dtype, c
     rows_per_tg = c["RPS"] * c["NSG"]
     act, ids, wts = up(
         inputs=[x, logits, moe.e_score_correction_bias, gu.weight, gu.scales, g_up],
-        template=[("T", x.dtype), ("K", H), ("INTER", inter), ("BITS", bits), ("HAS_GS", has_gs),
-                  ("P", c["P_UP"]), ("RPS", c["RPS"]), ("NSG", c["NSG"]), ("E", E), ("KE", KE)],
+        template=[("T", x.dtype), ("K", H), ("INTER", inter), ("BITS", bits), ("HAS_GS", has_gs), ("GS", 16 if bits == 4 else 32),
+                  ("RPS", c["RPS"]), ("NSG", c["NSG"]), ("E", E), ("KE", KE)],
         grid=(inter // rows_per_tg * 32 * c["NSG"], KE, 1), threadgroup=(32 * c["NSG"], 1, 1),
         output_shapes=[(KE, inter), (KE,), (KE,)], output_dtypes=[x.dtype, mx.uint32, mx.float32],
     )
@@ -324,7 +281,7 @@ def moe_decode_conv(hidden, moe, conv_state, conv_weight, residual, out_dtype, c
         inputs=[act, dn.weight, dn.scales, g_dn, ids, wts, conv_state.astype(mx.float32).reshape(3 * H),
                 conv_weight.reshape(H * 4), residual.reshape(H)],
         template=[("T", x.dtype), ("O", out_dtype), ("K", inter), ("N", H), ("KE", KE), ("BITS", bits),
-                  ("HAS_GS", has_gs), ("P", c["P_DOWN"]), ("ROWS", c["ROWS"])],
+                  ("HAS_GS", has_gs), ("ROWS", c["ROWS"]), ("GS", 16 if bits == 4 else 32)],
         grid=(H // c["ROWS"] * 32, KE, 1), threadgroup=(32, KE, 1),
         output_shapes=[(H,), (3 * H,)], output_dtypes=[out_dtype, mx.float32],
     )

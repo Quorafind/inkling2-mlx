@@ -38,6 +38,7 @@ from mlx_vlm.models.switch_layers import SwitchLinear, _gather_sort, _scatter_un
 
 from . import kernels
 from . import decode_kernels
+from . import depth_kernels
 from . import moe_kernels
 from . import prefill_kernels
 from .caches import QuantSinkKVCache, SinkKVCache, SinkRingKVCache
@@ -289,13 +290,20 @@ class Layer(DecoderLayer):
             h = self.input_layernorm(x).astype(dtype)
             return h, h, h
         if messages is None:
-            _, normed = _attnres([*blocks, x], self.attention_input.query, self._qkv_weight(),
-                                 write_mixed=False, out_dtype=dtype)
+            if depth_kernels.ACTIVE is not None:
+                normed = depth_kernels.depth_mix(blocks, self.attention_input.query, last=x,
+                                                 norm_weight=self._qkv_weight(), out_dtype=dtype)["normed"]
+            else:
+                _, normed = _attnres([*blocks, x], self.attention_input.query, self._qkv_weight(),
+                                     write_mixed=False, out_dtype=dtype)
             if self.is_sliding:
                 h = normed[..., 0, :]
                 return h, h, h
             return normed[..., 0, :], normed[..., 1, :], normed[..., 2, :]
-        mixed, _ = _attnres([*blocks, x], self.attention_input.query)
+        if depth_kernels.ACTIVE is not None:
+            mixed = depth_kernels.depth_mix(blocks, self.attention_input.query, last=x, write_mixed=True)["mixed"]
+        else:
+            mixed, _ = _attnres([*blocks, x], self.attention_input.query)
         n = B * L
         if prefill_kernels.use_kernels():  # fused gate kernels (prefill_kernels.message_gates)
             down, fg = self._gates3
@@ -323,17 +331,29 @@ class Layer(DecoderLayer):
         mask = _cache_padding_mask(conv, x.shape[1])
         q_in, k_in, v_in = self._attention_inputs(x, blocks, messages)
         attn = self.self_attn(q_in, k_in, v_in, cache=cache, conv_mask=mask)
+        sc = self.attn_sconv
+        if (depth_kernels.ACTIVE is not None and sc.kernel_size == 4 and attn.shape[0] * attn.shape[1] == 1
+                and prefill_kernels.conv_fast_ok(attn, conv, mask)):
+            return self._depth_tail(x, attn, blocks, conv, mask, messages, dtype)
         if self.is_block_boundary:
             residual = self.attn_sconv(attn, conv, mask, out_dtype=mx.float32)
             blocks.append(x)
         else:  # conv + residual add in one pass on the prefill kernel path
             residual = self.attn_sconv(attn, conv, mask, residual=x, out_dtype=mx.float32)
+        dm = depth_kernels.ACTIVE
         if messages is None:
-            _, hidden = _attnres([*blocks, residual], self.mlp_input.query,
-                                 self.post_attention_layernorm.weight, write_mixed=False, out_dtype=dtype)
+            if dm is not None:
+                hidden = depth_kernels.depth_mix(blocks, self.mlp_input.query, last=residual,
+                                                 norm_weight=self.post_attention_layernorm.weight, out_dtype=dtype)["normed"]
+            else:
+                _, hidden = _attnres([*blocks, residual], self.mlp_input.query,
+                                     self.post_attention_layernorm.weight, write_mixed=False, out_dtype=dtype)
             hidden = hidden[..., 0, :]
         else:
-            mixed, _ = _attnres([*blocks, residual], self.mlp_input.query)
+            if dm is not None:
+                mixed = depth_kernels.depth_mix(blocks, self.mlp_input.query, last=residual, write_mixed=True)["mixed"]
+            else:
+                mixed, _ = _attnres([*blocks, residual], self.mlp_input.query)
             B, L, H = x.shape
             down, fg = self._gate_mlp
             if prefill_kernels.use_kernels():
@@ -346,6 +366,33 @@ class Layer(DecoderLayer):
                       down, fg)
             hidden = self.post_attention_layernorm(h.reshape(B, L, H)).astype(dtype)
         return self._mlp_tail(x, residual, hidden, conv, mask, dtype)
+
+    def _depth_tail(self, x, attn, blocks, conv, mask, messages, dtype):
+        """One decode token: post-attention conv + residual and the MLP-input attention
+        residual in one kernel (depth_kernels.depth_mix), then the MLP."""
+        sc = self.attn_sconv
+        H = x.shape[-1]
+        state = conv[sc.conv_idx] if conv is not None else None
+        if state is None:
+            state = mx.zeros((1, 3, H), mx.float32)
+        base = None if self.is_block_boundary else x
+        if self.is_block_boundary:
+            blocks.append(x)
+        args = (attn, state, sc.conv.weight, base)
+        if messages is None:
+            r = depth_kernels.depth_mix(blocks, self.mlp_input.query, norm_weight=self.post_attention_layernorm.weight,
+                                        out_dtype=dtype, conv=args)
+            hidden = r["normed"][..., 0, :]
+        else:
+            r = depth_kernels.depth_mix(blocks, self.mlp_input.query, write_mixed=True, conv=args)
+            down, fg = self._gate_mlp
+            hidden = prefill_kernels.message_gates(
+                r["mixed"].reshape(1, 1, H), messages.reshape(1, 4, H), 3, 1, down, fg,
+                self.post_attention_layernorm.weight,
+            )[0].reshape(1, 1, H)
+        if conv is not None:
+            conv[sc.conv_idx] = r["state"]
+        return self._mlp_tail(x, r["residual"], hidden, conv, mask, dtype)
 
     def _mlp_tail(self, x, residual, hidden, conv, mask, dtype):
         sc = self.mlp_sconv
@@ -425,6 +472,14 @@ class TextModel(nn.Module):
         the final normalized state. Returns (normed, [captures]) when given."""
         cfg = self.config
         x = self.embed(input_ids) if input_embeddings is None else input_embeddings
+        depth_kernels.begin(x.shape[0] * x.shape[1])
+        try:
+            return self._forward(x, cache, capture)
+        finally:
+            depth_kernels.end()
+
+    def _forward(self, x, cache, capture):
+        cfg = self.config
         caches = cache if cache is not None else [None] * cfg.num_cache_layers
         start, end = cfg.loop_start, cfg.loop_end
         wanted = set(capture or ())
@@ -475,8 +530,12 @@ class TextModel(nn.Module):
         for i in range(end, cfg.num_hidden_layers):
             x = run(i, x, blocks, caches[i])
 
-        _, out = _attnres([*blocks, x], self.final_input.query, self.norm.weight,
-                          write_mixed=False, out_dtype=x.dtype)
+        if depth_kernels.ACTIVE is not None:
+            out = depth_kernels.depth_mix(blocks, self.final_input.query, last=x, norm_weight=self.norm.weight,
+                                          out_dtype=x.dtype)["normed"]
+        else:
+            _, out = _attnres([*blocks, x], self.final_input.query, self.norm.weight,
+                              write_mixed=False, out_dtype=x.dtype)
         out = out[..., 0, :]
         if capture is None:
             return out

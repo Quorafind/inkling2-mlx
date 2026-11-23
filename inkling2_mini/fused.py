@@ -131,6 +131,14 @@ class FusedAttention(Attention):
         out = _gated_output(out.transpose(0, 2, 1, 3).reshape(b, length, -1), gate)
         return self.o_proj(out)
 
+    def _rel_table(self, dtype):
+        """rel_proj (d_rel, rel_extent) as a contiguous (rel_extent, d_rel) table."""
+        t = getattr(self, "_rel_t", None)
+        if t is None or t.dtype != dtype:
+            t = self._rel_t = mx.contiguous(self.rel_proj.T.astype(dtype))
+            mx.eval(t)
+        return t
+
     def _rows(self, x, a, b):
         f = self.qkv_all
         if isinstance(f, nn.QuantizedLinear):
@@ -203,6 +211,11 @@ class FusedAttention(Attention):
             W = kv.max_size
             if b == 1 and DK.active() and self.head_dim == 128:
                 # fused ring-buffer decode attention: no mask, roll or concatenation
+                if prepped and q8dec.FUSED_EPILOGUE:
+                    # relative bias, sinks and output gate inside the attention kernels
+                    out = q8dec.ring_decode_attention_gated(q, k, v, n, oldest, W, r, self._rel_table(x.dtype),
+                                                            y, o1, o3)
+                    return self.o_proj(out)
                 rel_logits = (r @ rel_proj).reshape(b, self.n_heads, self.rel_extent)
                 out = q8dec.ring_decode_attention(q, k, v, n, oldest, W, rel_logits,
                                                   sinks.reshape(b, self.n_heads), self.rel_extent)
@@ -223,6 +236,9 @@ class FusedAttention(Attention):
                                         shape_ref=qk[0])
             if b == 1 and q8dec.supported(q, qk, kv):
                 # fused split-K decode / verify over the 8-bit cache (decode_attention.py)
+                if prepped and q8dec.FUSED_EPILOGUE:
+                    out = q8dec.q8_decode_attention_gated(q, qk, qv, r, self._rel_table(x.dtype), y, o1, o3)
+                    return self.o_proj(out)
                 rel_logits = (r @ rel_proj).transpose(0, 2, 1, 3)  # (B, heads, L, rel_extent)
                 out = q8dec.q8_decode_attention(q, qk, qv, rel_logits, sinks[..., 0], self.rel_extent)
                 out = _gated_output(out.transpose(0, 2, 1, 3).reshape(b, length, -1), gate)

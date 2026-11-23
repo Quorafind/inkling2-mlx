@@ -398,11 +398,23 @@ class ConfidencePolicy:
     # prose, code and thinking, T = 0 and 1 (6-bit dense, block 8).
     PRIOR_ACCEPT = (0.05, 0.08, 0.14, 0.19, 0.24, 0.33, 0.39, 0.44, 0.59, 0.69, 0.83, 0.94)
     # Verify round cost after the draft (forward over L tokens, sampling, commit) and a
-    # pipelined plain step, both at short context on the M6; replaced by measurements.
-    PRIOR_VERIFY_MS = {2: 55.0, 3: 65.0, 4: 78.0, 5: 89.0, 6: 93.0, 7: 100.0, 8: 108.0}
-    PRIOR_PLAIN_MS = 33.0
+    # pipelined plain step, at short context on the M6 (6-bit dense, 2026-11-23 kernels).
+    PRIOR_VERIFY_MS = {2: 50.0, 3: 62.0, 4: 71.0, 5: 81.0, 6: 91.0, 7: 101.0, 8: 111.0}
+    PRIOR_PLAIN_MS = 30.0
+    # Both grow with the context by about the same amount (one read of the KV per step);
+    # 6-bit plain decode: about +9.6 ms at 32k and +17 ms at 64k.
+    CONTEXT_MS_PER_1K = 0.28
 
-    def __init__(self, max_block=8, segment=24, max_segment=48, strength=8.0, window=100):
+    def __init__(self, max_block=8, segment=24, max_segment=48, strength=8.0, window=100,
+                 adaptive_costs=False):
+        """adaptive_costs: replace the cost table with wall-clock measurements as the run goes.
+        Off by default: the verify lengths then depend only on the draft's confidence, the
+        acceptance seen so far and the context length, so the same request takes the same
+        path and greedy output is reproducible. (Single-token decode and multi-token
+        verification differ in the last bits; with timing-driven lengths, two identical
+        requests could part at a near-tie.)"""
+        self.adaptive_costs = adaptive_costs
+        self.context = 0  # tokens in the cache; set by the caller each round
         self.max_block = max_block
         self.base_segment, self.max_segment = segment, max_segment
         self.segment = segment
@@ -436,7 +448,8 @@ class ConfidencePolicy:
         for L in range(2, limit + 1):
             survive *= self.accept_prob(conf[L - 2])
             expected += survive
-            value = expected - self.cost[L] / self.plain_cost
+            extra = self.CONTEXT_MS_PER_1K * self.context / 1e6  # seconds
+            value = expected - (self.cost[L] + extra) / (self.plain_cost + extra)
             if value > best_value:
                 best, best_value = L, value
         if best == 1:
@@ -450,6 +463,8 @@ class ConfidencePolicy:
         return seg
 
     def _update_cost(self, bs, seconds):
+        if not self.adaptive_costs:
+            return
         self.cost[bs] = seconds if bs not in self.seen else 0.7 * self.cost[bs] + 0.3 * seconds
         self.seen.add(bs)
         scale = sum(self.cost[k] / self.prior[k] for k in self.seen) / len(self.seen)
@@ -471,4 +486,6 @@ class ConfidencePolicy:
         self._update_cost(bs, seconds)
 
     def observe_plain(self, seconds_per_token):
+        if not self.adaptive_costs:
+            return
         self.plain_cost = 0.7 * self.plain_cost + 0.3 * seconds_per_token

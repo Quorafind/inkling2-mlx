@@ -334,6 +334,7 @@ class Inkling2Mini:
                 mx.eval(drafts, conf)
                 hidden = state.hidden = None  # consumed by the draft
                 conf = conf.reshape(-1).tolist()
+                policy.context = state.length
                 bs = policy.choose_length(conf, limit=max_tokens - n + 1)
                 drafts = drafts[:, : bs - 1]
                 if bs <= 1:

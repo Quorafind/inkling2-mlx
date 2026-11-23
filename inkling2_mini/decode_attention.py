@@ -280,3 +280,134 @@ def ring_decode_attention(q, keys, values, n, oldest, window, rel_logits, sinks,
         output_shapes=[(B * H, D)], output_dtypes=[q.dtype],
     )[0]
     return out.reshape(B, H, 1, D)
+
+
+# ------------------------------------------- decode attention with the epilogue fused
+# The relative-position bias is computed in pass 1 from the attn_prep relative states r and
+# the layer's (rel_extent, d_rel) table: the simdgroup sums r[i] * table[dist, i] over its
+# first d_rel lanes and rounds the bias to the model dtype, as the unfused BF16
+# r @ rel_proj does. (Adding it unrounded is closer to FP32 truth, but then decode drifts
+# from the multi-token paths, and DSpark's timing-driven verify lengths made greedy server
+# output depend on the run.) Pass 2 reads the sink logits and the output gate straight from the fused
+# projection output y and writes T(T(attn) * sigmoid(gate)) as (B, L, H * 128), the o_proj
+# input. Replaces r @ rel_proj, its copy, the sink cast and copy, the transpose copy and the
+# gate kernel.
+FUSED_EPILOGUE = True  # A/B switch
+
+_REL_OLD_RING = """            score = simd_sum(score);
+            if (dist < REL) score += float(bias[int64_t(base_head + j) * REL + dist]);"""
+_REL_OLD_Q8 = """            score = simd_sum(score);
+            if (dist < REL) score += float(bias[(int64_t(base_head + j) * L + l) * REL + dist]);"""
+_REL_NEW = """            score = simd_sum(score);
+            if (dist < REL) {   // bias rounded to T, as the reference's BF16 r @ rel_proj
+                float b = simd_sum(simd_lid < D_REL ? rq[j] * float(rel_table[dist * D_REL + simd_lid]) : 0.0f);
+                score += float(static_cast<T>(b));
+            }"""
+_RQ_RING = """    float rq[G];
+    for (int j = 0; j < G; j++)
+        rq[j] = simd_lid < D_REL ? float(r[(base_head + j) * D_REL + simd_lid]) : 0.0f;
+    for (int t = s0; t < s1; t++) {"""
+_RQ_Q8 = """    float rq[G];
+    for (int j = 0; j < G; j++)
+        rq[j] = simd_lid < D_REL ? float(r[(int64_t(l) * num_q + base_head + j) * D_REL + simd_lid]) : 0.0f;
+    for (int t = s0; t < s1; t++) {"""
+
+_PASS2_GATED = r"""
+    // grid: (B * H * L) threadgroups of 128 threads; row = (b * H + h) * L + l.
+    const int row = threadgroup_position_in_grid.x;
+    const int d = thread_position_in_threadgroup.x;
+    const int parts = meta[1], L = meta[2];
+    const int l = row % L, h = (row / L) % NH, b = row / (L * NH);
+    const device T* yr = y + (int64_t(b) * L + l) * YW;
+    const device float* m = maxs + row * parts;
+    const device float* s = sums + row * parts;
+    float sink = float(yr[O_SINK + h]);
+    float M = sink;
+    for (int k = 0; k < parts; k++) M = max(M, m[k]);
+    float denom = fast::exp(sink - M), acc = 0;
+    for (int k = 0; k < parts; k++) {
+        float w = (m[k] == -INFINITY) ? 0.0f : fast::exp(m[k] - M);
+        denom += w * s[k];
+        acc += w * partials[(int64_t(row) * parts + k) * 128 + d];
+    }
+    float a = float(static_cast<T>(acc / denom));
+    float g = float(yr[O_GATE + h * 128 + d]);
+    float sy = 1.0f / (1.0f + metal::exp(-metal::abs(g)));   // MLX's Sigmoid
+    float sg = g < 0 ? 1.0f - sy : sy;
+    out[((int64_t(b) * L + l) * NH + h) * 128 + d] = static_cast<T>(a * sg);
+"""
+
+
+def _fused_kernels():
+    if "f_ring" not in _k:
+        ring = _RING.replace("SCALE", f"{128 ** -0.5:.9e}f")
+        assert ring.count(_REL_OLD_RING) == 1
+        ring = ring.replace(_REL_OLD_RING, _REL_NEW).replace("    for (int t = s0; t < s1; t++) {", _RQ_RING, 1)
+        _k["f_ring"] = mx.fast.metal_kernel(
+            name="inkling_ring_decode_pass1_rel", input_names=["queries", "k", "v", "r", "rel_table", "meta"],
+            output_names=["partials", "sums", "maxs"], source=ring, ensure_row_contiguous=False)
+        p1 = _PASS1.replace("SCALE", f"{128 ** -0.5:.9e}f")
+        assert p1.count(_REL_OLD_Q8) == 1
+        p1 = p1.replace(_REL_OLD_Q8, _REL_NEW).replace("    for (int t = s0; t < s1; t++) {", _RQ_Q8, 1)
+        _k["f_p1"] = mx.fast.metal_kernel(
+            name="inkling_q8_decode_pass1_rel",
+            input_names=["queries", "kw", "ks", "kb", "vw", "vs", "vb", "r", "rel_table", "meta"],
+            output_names=["partials", "sums", "maxs"], source=p1, ensure_row_contiguous=False)
+        _k["f_p2"] = mx.fast.metal_kernel(
+            name="inkling_decode_pass2_gated", input_names=["partials", "sums", "maxs", "y", "meta"],
+            output_names=["out"], source=_PASS2_GATED)
+    return _k["f_ring"], _k["f_p1"], _k["f_p2"]
+
+
+def _gated_pass2(partials, sums, maxs, y, meta, B, H, L, o_gate, o_sink, dtype):
+    p2 = _fused_kernels()[2]
+    return p2(
+        inputs=[partials, sums, maxs, y, meta],
+        template=[("T", dtype), ("NH", H), ("YW", y.shape[-1]), ("O_GATE", o_gate), ("O_SINK", o_sink)],
+        grid=(B * H * L * 128, 1, 1), threadgroup=(128, 1, 1),
+        output_shapes=[(B, L, H * 128)], output_dtypes=[dtype],
+    )[0]
+
+
+def ring_decode_attention_gated(q, keys, values, n, oldest, window, r, rel_table, y, o_gate, o_sink, blocks=8):
+    """ring_decode_attention + relative bias + sinks + output gate. q (1, H, 1, 128) and
+    r (1, 1, H, d_rel) from attn_prep; rel_table (rel_extent, d_rel); y (1, 1, N) the fused
+    projection output (gate at columns o_gate.., sink logits at o_sink..). Returns the gated
+    attention output (1, 1, H * 128), the o_proj input."""
+    B, H, _, D = q.shape
+    KV = keys.shape[1]
+    G = H // KV
+    ring = _fused_kernels()[0]
+    blocks = max(1, min(blocks, n))
+    parts = blocks * G
+    full = int(n >= window)
+    meta = mx.array([n, parts, oldest if full else 0, full], mx.int32)
+    partials, sums, maxs = ring(
+        inputs=[q.reshape(B * H, D), keys, values, r, rel_table, meta],
+        template=[("T", q.dtype), ("G", G), ("REL", rel_table.shape[0]), ("W", window), ("D_REL", rel_table.shape[1])],
+        grid=(KV * 32, B * G, blocks), threadgroup=(32, G, 1),
+        output_shapes=[(B * H, parts, D), (B * H, parts), (B * H, parts)],
+        output_dtypes=[mx.float32, mx.float32, mx.float32],
+    )
+    meta2 = mx.array([n, parts, 1], mx.int32)
+    return _gated_pass2(partials, sums, maxs, y, meta2, B, H, 1, o_gate, o_sink, q.dtype)
+
+
+def q8_decode_attention_gated(q, qk, qv, r, rel_table, y, o_gate, o_sink):
+    """q8_decode_attention + relative bias + sinks + output gate (B = 1). q (1, H, L, 128),
+    r (1, L, H, d_rel); y (1, L, N). Returns (1, L, H * 128)."""
+    B, H, L, D = q.shape
+    KV, N = qk[0].shape[1], qk[0].shape[2]
+    G = H // KV
+    blocks = blocks_for(N)
+    parts = blocks * G
+    p1 = _fused_kernels()[1]
+    meta = mx.array([N, parts, L], mx.int32)
+    partials, sums, maxs = p1(
+        inputs=[q.reshape(B * H, L, D), *qk, *qv, r, rel_table, meta],
+        template=[("T", q.dtype), ("G", G), ("REL", rel_table.shape[0]), ("D_REL", rel_table.shape[1])],
+        grid=(KV * 32, B * G * L, blocks), threadgroup=(32, G * L, 1),
+        output_shapes=[(B * H * L, parts, D), (B * H * L, parts), (B * H * L, parts)],
+        output_dtypes=[mx.float32, mx.float32, mx.float32],
+    )
+    return _gated_pass2(partials, sums, maxs, y, meta, B, H, L, o_gate, o_sink, q.dtype)

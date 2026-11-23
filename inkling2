@@ -1,0 +1,11 @@
+#!/bin/sh
+# Inkling 2 Mini launcher: builds launcher/ on first use (or after its sources change), then runs it.
+#   ./inkling2                 serve the local OpenAI-compatible API on 127.0.0.1:8000
+#   ./inkling2 serve --port N  options: ./inkling2 serve --help
+#   ./inkling2 chat            interactive terminal chat
+DIR="$(cd "$(dirname "$0")" && pwd)"
+BIN="$DIR/launcher/target/release/inkling2"
+if [ ! -x "$BIN" ] || [ -n "$(find "$DIR/launcher/src" "$DIR/launcher/Cargo.toml" -newer "$BIN" 2>/dev/null | head -1)" ]; then
+  cargo build --release --manifest-path "$DIR/launcher/Cargo.toml" || exit 1
+fi
+exec "$BIN" "$@"

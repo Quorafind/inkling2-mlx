@@ -1,0 +1,74 @@
+diff --git a/engine/src/inkling2/ink_main.cpp b/engine/src/inkling2/ink_main.cpp
+index c065d6c..8a2749e 100644
+--- a/engine/src/inkling2/ink_main.cpp
++++ b/engine/src/inkling2/ink_main.cpp
+@@ -282,11 +282,15 @@ static int cmd_kld_eval(const std::string& model_path, const std::string& ref_pa
+     if (V != V_ref) { fprintf(stderr, "vocab mismatch %d vs %d\n", V, V_ref); return 1; }
+ 
+     std::vector<float> got_lg(static_cast<size_t>(n_tok) * V);
+-    StepBatch batch;
+-    for (int i = 0; i < n_tok; ++i) batch.push(0, i, ids[i], true);
+-    if (!backend->forward_batch(batch, got_lg.data(), nullptr, err)) {
+-        fprintf(stderr, "forward: %s\n", err.c_str());
+-        return 1;
++    // FIX (local test): the Metal runner computes logits for at most 64 rows per batch; evaluate in 64-token chunks.
++    for (int p0 = 0; p0 < n_tok; p0 += 64) {
++        StepBatch batch;
++        const int len = std::min(64, n_tok - p0);
++        for (int i = 0; i < len; ++i) batch.push(0, p0 + i, ids[p0 + i], true);
++        if (!backend->forward_batch(batch, got_lg.data() + static_cast<size_t>(p0) * V, nullptr, err)) {
++            fprintf(stderr, "forward: %s\n", err.c_str());
++            return 1;
++        }
+     }
+ 
+     double kld_sum = 0.0, nll_sum = 0.0;
+diff --git a/engine/src/inkling2/metal/ink_metal_common.h b/engine/src/inkling2/metal/ink_metal_common.h
+index d7d22e1..25bc1ea 100644
+--- a/engine/src/inkling2/metal/ink_metal_common.h
++++ b/engine/src/inkling2/metal/ink_metal_common.h
+@@ -645,13 +645,43 @@ struct InkMetalModel {
+             ti.shape = kv.second.shape;
+             ti.off = kv.second.off;
+             ti.bytes = kv.second.bytes;
+-            man.D[kv.first] = std::move(ti);
++            // FIX (local test): mtp.safetensors names lack the "dspark." prefix the runner looks up.
++            man.D[kv.first.rfind("dspark.", 0) == 0 ? kv.first : "dspark." + kv.first] = std::move(ti);
+         }
+ 
+         // 2. Read Section 1 (Trunk + DSpark) and plan native lossless GGUF_RAW or transcoded S_K expert layout
+         std::vector<uint8_t> sec1;
+         if (!mf.read_section1(sec1, err)) return false;
+ 
++        // FIX (local test): the Metal kernels read 1-D trunk / DSpark tensors (norm weights, biases, scales) as
++        // float32, but official safetensors store them as BF16. Promote them to F32, appended to Section 1.
++        {
++            size_t n_promoted = 0;
++            auto promote = [&](std::unordered_map<std::string, InkTensorInfo>& tab) {
++                for (auto& kv : tab) {
++                    InkTensorInfo& ti = kv.second;
++                    const std::string& nm = kv.first;
++                    auto ends = [&](const char* suf) { size_t L = std::strlen(suf); return nm.size() >= L && nm.compare(nm.size() - L, L, suf) == 0; };
++                    const bool read_as_f32 = ti.shape.size() == 1 || ends("_sconv.weight") || ends(".static_w") ||
++                                             ends(".q_l2_clip.scale") || ends(".rel_l2_clip.scale") || ends(".rel_logits_proj.proj") ||
++                                             ends(".gain_weight") || ends(".forget_weight");
++                    if (ti.fmt != FMT_BF16 || !read_as_f32) continue;
++                    const size_t n = ti.bytes / 2;
++                    std::vector<uint16_t> src(n);
++                    std::memcpy(src.data(), sec1.data() + ti.off, n * 2);
++                    const size_t off = (sec1.size() + 63) & ~size_t(63);
++                    sec1.resize(off + n * 4);
++                    float* dst = reinterpret_cast<float*>(sec1.data() + off);
++                    for (size_t i = 0; i < n; ++i) { uint32_t u = (uint32_t)src[i] << 16; std::memcpy(dst + i, &u, 4); }
++                    ti.off = off; ti.bytes = n * 4; ti.fmt = FMT_F32;
++                    ++n_promoted;
++                }
++            };
++            promote(man.T);
++            promote(man.D);
++            fprintf(stderr, "[ink_metal] local fix: promoted %zu BF16 tensors read as float to F32\n", n_promoted);
++        }
++
+         const size_t n_total = (size_t)man.c.n_phys * (size_t)man.c.n_experts;
+         const bool force_sk = (std::getenv("INK_METAL_FORCE_SK_TRANSCODE") && std::getenv("INK_METAL_FORCE_SK_TRANSCODE")[0] == '1');
+         const auto& raw_dir = mf.expert_directory();

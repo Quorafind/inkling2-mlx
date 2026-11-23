@@ -7,7 +7,7 @@
 | | 本项目 | Strata |
 | --- | --- | --- |
 | 范围 | 只支持 Inkling 2 Mini 和 Apple Silicon | 多个模型（Qwen3.8-Flash-Next、Qwen3.6-35B-A3B、Hy4-Flash、Inkling 2 Mini）。后端有 CUDA、HIP、SYCL、Metal、CPU（`README.md`） |
-| 实现 | Python + MLX，另有自写 Metal kernel；启动器和 HTTP 服务用 Rust | C++ 引擎 `strata-inkling`。Inkling 有单独的 Metal 后端，着色器手写（`engine/src/inkling2/metal/`）。服务端用 Python（`terminal/serve/`），另有桌面 app |
+| 实现 | Python + MLX，加上一些自定义 Metal kernel；启动器和 HTTP 服务用 Rust | C++ 引擎 `strata-inkling`。Inkling 有单独的 Metal 后端（`engine/src/inkling2/metal/`）。服务端用 Python（`terminal/serve/`），另有桌面 app |
 | 权重 | 直接读官方 safetensors。专家保持训练时的 NVFP4 / MXFP8；attention 投影和 lm_head 用仿射 6-bit（可选 8 / 16） | 自家 `.strata` 包：SQ-20 为 19.3 GB，"near-lossless native SF4+MX8"；SQ-15 为 14.3 GB；SQ-10 为 10.5 GB（`docs/MODELS.md`）。也支持 Unsloth GGUF，或直接读官方 safetensors：NVFP4 转 SF4、MXFP8 转 MX8，主干保持 BF16（`ink_safetensors_loader.h`） |
 | 内存 | 全部常驻统一内存，加载后 18.91 GB | 专家按显存 / 内存 / SSD 分层存放（`docs/HOW_IT_WORKS.md`）。在 Mac 上要么常驻，要么从 SSD 读 |
 | 投机解码 | 用自带的 DSpark，按线性链验证。每轮按草稿自身的置信度选验证长度，不划算就退回普通解码；草稿层为 8-bit | 用自带的 DSpark，做树状验证。按一个校准过的验证耗时模型选长度；草稿的 Markov 步只对前 512 个候选打分（`ink_metal_runner.h`、`ink_metal_dspark.metal`） |

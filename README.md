@@ -1,6 +1,6 @@
 # Inkling 2 Mini on Apple silicon (MLX)
 
-A hand-written MLX runtime for Thinking Machines' **Inkling 2 Mini**
+An MLX runtime for Thinking Machines' **Inkling 2 Mini**
 (`thinkingmachines/Inkling-2-Mini`, model type `inkling2_loop`, released 2026-11-20).
 
 - **Native experts.** The NVFP4 / MXFP8 experts run as native MLX quantized matmuls, exactly

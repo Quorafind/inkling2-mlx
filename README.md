@@ -63,10 +63,14 @@ ids:
 
 | | Strata 0.1.66 (with a local fix) | This project, BF16 dense | This project, 6-bit dense (default) |
 | --- | --- | --- | --- |
-| Plain decode | 21.7 tok/s | 20.5 tok/s | 30.1 tok/s |
-| DSpark on code | 22–26 tok/s | 20–29 tok/s | 39–40 tok/s |
+| Plain decode | 21.7 tok/s | 23.6 tok/s | 34.7 tok/s |
+| DSpark on code | 22–26 tok/s | 27–33 tok/s | 36–40 tok/s |
 | Prefill 8k / 32k | 718 / 627 tok/s | 967 / 867 tok/s | 879 / 805 tok/s |
 | Mean KL vs CPU-FP32 truth | 9.3e-4 | 4.3e-3 | 8.2e-3 |
+
+This project's decode rows were re-measured after the decode fusions (Performance item 11),
+with the same script and inputs; Strata's column, prefill and KL are from the original run.
+(Before the fusions: 20.5 and 30.1 tok/s plain, 20–29 and 39–40 with DSpark on code.)
 
 - **Strata's official-safetensors path on Metal prints garbage as released.** Its Metal
   kernels read small BF16 tensors (norm weights, scales, short-conv taps) as FP32.
